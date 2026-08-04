@@ -1,0 +1,1035 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #C8A96A;
+  --color-sidebar: #111827;
+  --color-workspace: #F5F5F4;
+  --color-border-dark: rgba(255, 255, 255, 0.1);
+  
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-workspace text-slate-900 antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--color-primary) 75%, white 25%);
+    outline-offset: 2px;
+  }
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+}
+
+.custom-scrollbar:hover::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.custom-scrollbar-dark::-webkit-scrollbar {
+  width: 5px;
+}
+
+.custom-scrollbar-dark::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 10px;
+}
+
+.custom-scrollbar-dark::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+}
+
+.custom-scrollbar-dark::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.pd-hotspot-wrap {
+  position: relative;
+  cursor: pointer;
+}
+
+.pd-hotspot-core {
+  position: relative;
+  border-radius: 9999px;
+  background: var(--pd-hotspot-fill, rgba(255, 255, 255, 0.1));
+  border: var(--pd-hotspot-border, clamp(2px, calc(var(--pd-hotspot-size, 34px) * 0.08), 5px)) solid rgba(255, 255, 255, 0.96);
+  box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.28), 0 2px 10px rgba(0, 0, 0, 0.48);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pd-hotspot-core-ring {
+  background: transparent !important;
+}
+
+.pd-hotspot-core-pulse {
+  position: relative;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  overflow: visible;
+}
+
+.pd-hotspot-pulse-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--pd-ring-size, calc(var(--pd-hotspot-size, 34px) * 0.30));
+  height: var(--pd-ring-size, calc(var(--pd-hotspot-size, 34px) * 0.30));
+  border: var(--pd-hotspot-pulse-stroke, 2px) solid var(--pd-hotspot-pulse-color, rgba(255, 255, 255, 0.95));
+  border-radius: 9999px;
+  transform: translate(-50%, -50%) scale(0.6);
+  pointer-events: none;
+  animation: pd-hotspot-core-pulse 2.4s ease-out infinite;
+}
+
+.pd-hotspot-pulse-ring-a {
+  animation: pd-hotspot-core-pulse 1.9s ease-out infinite;
+}
+
+.pd-hotspot-pulse-ring-b {
+  animation: pd-hotspot-core-pulse 1.9s ease-out .72s infinite;
+}
+
+.pd-hotspot-pulse-center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: calc(var(--pd-hotspot-size, 34px) * 0.22);
+  height: calc(var(--pd-hotspot-size, 34px) * 0.22);
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.45), 0 0 14px rgba(255, 255, 255, 0.9);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.pd-hotspot-core-vista {
+  position: relative;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  overflow: visible;
+}
+
+.pd-hotspot-vista-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--pd-ring-size, var(--pd-hotspot-vista-ring-size, calc(var(--pd-hotspot-size, 34px) * 0.95)));
+  height: var(--pd-ring-size, var(--pd-hotspot-vista-ring-size, calc(var(--pd-hotspot-size, 34px) * 0.95)));
+  border: 2px solid var(--pd-hotspot-vista-color, rgba(255,255,255,0.9));
+  border-radius: 9999px;
+  transform: translate(-50%, -50%) scale(0.6);
+  opacity: 0;
+  pointer-events: none;
+  animation: pd-hotspot-vista-pulse 2.4s ease-out infinite;
+}
+
+.pd-hotspot-vista-ring-a {
+  animation: pd-hotspot-vista-pulse 2.4s ease-out 0s infinite;
+}
+
+.pd-hotspot-vista-ring-b {
+  animation: pd-hotspot-vista-pulse 2.4s ease-out .8s infinite;
+}
+
+.pd-hotspot-vista-ring-c {
+  animation: pd-hotspot-vista-pulse 2.4s ease-out 1.6s infinite;
+}
+
+.pd-hotspot-vista-center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: calc(var(--pd-hotspot-size, 34px) * 0.30);
+  height: calc(var(--pd-hotspot-size, 34px) * 0.30);
+  min-width: 9px;
+  min-height: 9px;
+  border-radius: 9999px;
+  background: var(--pd-hotspot-vista-color, rgba(255,255,255,0.9));
+  box-shadow: 0 0 0 3px rgba(255,255,255,0.25);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  transition: transform .15s ease;
+}
+
+.pd-hotspot-wrap:hover .pd-hotspot-vista-center,
+.pd-hotspot-wrap:focus-within .pd-hotspot-vista-center {
+  transform: translate(-50%, -50%) scale(1.25);
+}
+
+.pd-hotspot-core-floor-pulse {
+  position: relative;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  overflow: visible;
+}
+
+.pd-hotspot-floor-shadow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: calc(var(--pd-hotspot-floor-ring-width, 110px) * 1.18);
+  height: calc(var(--pd-hotspot-floor-ring-height, 38px) * 1.16);
+  border-radius: 9999px;
+  background: radial-gradient(ellipse, var(--pd-hotspot-floor-shadow-glow, rgba(255,255,255,0.12)) 0%, transparent 70%);
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  animation: pd-hotspot-floor-shadow-pulse var(--pd-hotspot-floor-pulse-duration, 2.4s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-hotspot-floor-ping {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--pd-ring-size, var(--pd-hotspot-floor-ring-width, 110px));
+  height: calc(var(--pd-ring-size, var(--pd-hotspot-floor-ring-width, 110px)) * 0.345);
+  border-radius: 9999px;
+  border: 1.5px solid color-mix(in oklab, var(--pd-hotspot-floor-ring-color, rgba(255,255,255,0.95)) 88%, transparent 12%);
+  transform: translate(-50%, -50%) scale(1);
+  opacity: 0;
+  pointer-events: none;
+  animation: pd-hotspot-floor-ping-out 2.8s ease-out infinite;
+  z-index: 2;
+}
+
+.pd-hotspot-floor-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--pd-hotspot-floor-ring-width, 110px);
+  height: var(--pd-hotspot-floor-ring-height, 38px);
+  border-radius: 9999px;
+  border: 3px solid var(--pd-hotspot-floor-ring-color, rgba(255,255,255,0.95));
+  box-shadow:
+    0 0 10px 3px var(--pd-hotspot-floor-ring-glow, rgba(255,255,255,0.7)),
+    0 0 28px 8px var(--pd-hotspot-floor-ring-glow-soft, rgba(255,255,255,0.35)),
+    inset 0 0 8px color-mix(in oklab, var(--pd-hotspot-floor-ring-color, rgba(255,255,255,0.95)) 20%, transparent 80%);
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  animation: pd-hotspot-floor-ring-pulse var(--pd-hotspot-floor-pulse-duration, 2.4s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-hotspot-floor-dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: var(--pd-hotspot-floor-dot-color, rgba(255,255,255,0.95));
+  box-shadow: 0 0 8px 3px var(--pd-hotspot-floor-dot-glow, rgba(255,255,255,0.6));
+  transform: translate(-50%, -50%);
+  z-index: 4;
+  animation: pd-hotspot-floor-dot-pulse var(--pd-hotspot-floor-pulse-duration, 2.4s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-hotspot-core-floor-circle {
+  position: relative;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  overflow: visible;
+}
+
+.pd-hotspot-floor-circle-ping {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--pd-ring-size, var(--pd-hotspot-floor-circle-width, 110px));
+  height: calc(var(--pd-ring-size, var(--pd-hotspot-floor-circle-width, 110px)) * 0.31);
+  border-radius: 9999px;
+  border: 1.5px solid color-mix(in oklab, var(--pd-hotspot-floor-circle-color, rgba(255,255,255,0.95)) 88%, transparent 12%);
+  transform: translate(-50%, -50%) scale(1);
+  opacity: 0;
+  pointer-events: none;
+  animation: pd-hotspot-floor-circle-ping-out var(--pd-hotspot-floor-circle-duration, 2.2s) ease-out infinite;
+  z-index: 2;
+}
+
+.pd-hotspot-floor-circle-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--pd-hotspot-floor-circle-width, 110px);
+  height: var(--pd-hotspot-floor-circle-height, 34px);
+  border-radius: 9999px;
+  border: 3px solid var(--pd-hotspot-floor-circle-color, rgba(255,255,255,0.95));
+  box-shadow:
+    0 0 10px 3px var(--pd-hotspot-floor-circle-glow, rgba(255,255,255,0.7)),
+    0 0 22px 6px var(--pd-hotspot-floor-circle-soft, rgba(255,255,255,0.3));
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  animation: pd-hotspot-floor-circle-ring-pulse var(--pd-hotspot-floor-circle-duration, 2.2s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-hotspot-floor-circle-inner {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: calc(var(--pd-hotspot-floor-circle-width, 110px) * 0.58);
+  height: calc(var(--pd-hotspot-floor-circle-height, 34px) * 0.62);
+  border-radius: 9999px;
+  border: 2px solid color-mix(in oklab, var(--pd-hotspot-floor-circle-core, rgba(255,255,255,0.55)) 78%, transparent 22%);
+  transform: translate(-50%, -50%);
+  z-index: 4;
+  animation: pd-hotspot-floor-circle-inner-pulse var(--pd-hotspot-floor-circle-duration, 2.2s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-hotspot-floor-circle-dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--pd-hotspot-floor-circle-color, rgba(255,255,255,0.95));
+  box-shadow: 0 0 7px 3px var(--pd-hotspot-floor-circle-glow, rgba(255,255,255,0.7));
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  animation: pd-hotspot-floor-circle-dot-pulse var(--pd-hotspot-floor-circle-duration, 2.2s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-hotspot-core-floor {
+  background: transparent !important;
+}
+
+.pd-hotspot-core-curved {
+  transform: perspective(var(--pd-hotspot-floor-perspective, 180px))
+    rotateX(var(--pd-hotspot-floor-rotate, 0deg))
+    scale(var(--pd-hotspot-floor-scale-x, 1), var(--pd-hotspot-floor-scale-y, 1));
+  transform-origin: center center;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, var(--pd-hotspot-floor-shadow, 0));
+}
+
+.pd-hotspot-ring-inner {
+  width: 36%;
+  height: 36%;
+  border-radius: 9999px;
+  background: transparent;
+}
+
+.pd-hotspot-dot {
+  width: clamp(6px, calc(var(--pd-hotspot-size, 34px) * 0.22), 18px);
+  height: clamp(6px, calc(var(--pd-hotspot-size, 34px) * 0.22), 18px);
+  border-radius: 9999px;
+  background: rgba(15, 23, 42, .55);
+}
+
+.pd-hotspot-glyph {
+  width: calc(var(--pd-hotspot-size, 34px) * 0.68);
+  height: calc(var(--pd-hotspot-size, 34px) * 0.68);
+  font-size: calc(var(--pd-hotspot-size, 34px) * 0.68);
+  line-height: 1;
+  color: rgba(15, 23, 42, .72);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.pd-hotspot-glyph svg {
+  width: 100%;
+  height: 100%;
+}
+
+.pd-hotspot-del {
+  position: absolute;
+  right: 0;
+  top: 0;
+  transform: translate(62%, -62%) scale(0.9);
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  border: 1.5px solid rgba(255,255,255,0.95);
+  background: #ef4444;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, .35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .15s ease, transform .15s ease, background-color .15s ease;
+}
+
+.pd-hotspot-move {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-62%, -62%) scale(0.9);
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  border: 1px solid #fff;
+  background: #2563eb;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, .28);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .15s ease, transform .15s ease, background-color .15s ease;
+}
+
+.pd-hotspot-wrap:hover .pd-hotspot-del,
+.pd-hotspot-wrap:focus-within .pd-hotspot-del,
+.pd-hotspot-wrap:hover .pd-hotspot-move,
+.pd-hotspot-wrap:focus-within .pd-hotspot-move,
+.pd-hotspot-move:focus-visible,
+.pd-hotspot-del:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.pd-hotspot-wrap:hover .pd-hotspot-del,
+.pd-hotspot-wrap:focus-within .pd-hotspot-del,
+.pd-hotspot-del:focus-visible {
+  transform: translate(62%, -62%) scale(1);
+}
+
+.pd-hotspot-del:hover {
+  background: #dc2626;
+}
+
+.pd-hotspot-wrap:hover .pd-hotspot-move,
+.pd-hotspot-wrap:focus-within .pd-hotspot-move,
+.pd-hotspot-move:focus-visible {
+  transform: translate(-62%, -62%) scale(1);
+}
+
+.pd-hotspot-move:hover {
+  background: #1d4ed8;
+}
+
+@keyframes pd-pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.08)} }
+@keyframes pd-ping { 0%{box-shadow:0 0 0 0 rgba(255,255,255,.58)} 100%{box-shadow:0 0 0 16px rgba(255,255,255,0)} }
+@keyframes pd-breathe { 0%,100%{opacity:1} 50%{opacity:.7} }
+@keyframes pd-float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)} }
+@keyframes pd-glow { 0%,100%{filter:drop-shadow(0 0 0 rgba(200,169,106,0))} 50%{filter:drop-shadow(0 0 8px rgba(200,169,106,.9))} }
+@keyframes pd-arrow-bounce { 0%,100%{transform:translateX(0)} 50%{transform:translateX(4px)} }
+@keyframes pd-blink { 0%,49%,100%{opacity:1} 50%,99%{opacity:.2} }
+@keyframes pd-ring-expand { 0%{transform:scale(.9);opacity:.7} 100%{transform:scale(1.25);opacity:0} }
+@keyframes pd-hotspot-core-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.6);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.6);
+    opacity: 0;
+  }
+}
+
+@keyframes pd-hotspot-vista-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.6);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.6);
+    opacity: 0;
+  }
+}
+
+@keyframes pd-hotspot-floor-ping-out {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.85;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(3);
+    opacity: 0;
+  }
+}
+
+@keyframes pd-hotspot-floor-ring-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+@keyframes pd-hotspot-floor-dot-pulse {
+  0%, 100% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: translate(-50%, -50%) scale(0.6);
+    opacity: 0.5;
+  }
+}
+
+@keyframes pd-hotspot-floor-shadow-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes pd-hotspot-floor-circle-ping-out {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.8;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.45);
+    opacity: 0;
+  }
+}
+
+@keyframes pd-hotspot-floor-circle-ring-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.58;
+  }
+}
+
+@keyframes pd-hotspot-floor-circle-inner-pulse {
+  0%, 100% {
+    opacity: 0.8;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: translate(-50%, -50%) scale(1.14);
+  }
+}
+
+@keyframes pd-hotspot-floor-circle-dot-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  50% {
+    opacity: 0.65;
+    transform: translate(-50%, -50%) scale(0.7);
+  }
+}
+
+.pd-anim-pulse .pd-hotspot-core { animation: pd-pulse 1.6s ease-in-out infinite; }
+.pd-anim-ping .pd-hotspot-core { animation: pd-ping 1.4s ease-out infinite; }
+.pd-anim-breathe .pd-hotspot-core { animation: pd-breathe 2.2s ease-in-out infinite; }
+.pd-anim-float .pd-hotspot-core { animation: pd-float 1.8s ease-in-out infinite; }
+.pd-anim-glow .pd-hotspot-core { animation: pd-glow 1.8s ease-in-out infinite; }
+.pd-anim-arrow-bounce .pd-hotspot-core { animation: pd-arrow-bounce 1s ease-in-out infinite; }
+.pd-anim-blink .pd-hotspot-core { animation: pd-blink 1.2s linear infinite; }
+.pd-anim-ring-expand .pd-hotspot-core::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border: 2px solid rgba(255,255,255,.65);
+  border-radius: 9999px;
+  animation: pd-ring-expand 1.3s ease-out infinite;
+}
+
+.pd-anim-ring-ping .pd-hotspot-core-ring {
+  animation: pd-pulse 1.2s ease-in-out infinite;
+}
+
+.pd-anim-ring-ping .pd-hotspot-core-ring::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border: 2px solid rgba(255, 255, 255, 0.78);
+  border-radius: 9999px;
+  animation: pd-ring-expand 1.05s ease-out infinite;
+}
+
+.pd-hotspot-preview {
+  width: 140px;
+  height: 84px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,.45);
+  box-shadow: 0 10px 24px rgba(0,0,0,.35);
+  background: #111827;
+}
+
+.pd-hotspot-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center center;
+  transform: scale(1.32);
+  opacity: 0.85;
+  display: block;
+}
+
+.pd-hotspot-preview-bg {
+  width: 100%;
+  height: 100%;
+  background-size: 220% auto;
+  background-position: center center;
+  background-repeat: no-repeat;
+  transform: none;
+  transform-origin: center center;
+  opacity: 0.85;
+}
+
+/* Remove PSV tooltip padding when it wraps a scene preview thumbnail */
+.psv-tooltip-content:has(.pd-hotspot-preview) {
+  padding: 0 !important;
+}
+.psv-tooltip:has(.pd-hotspot-preview) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+/* Photo Sphere tooltip CSS can override image sizing; force hotspot preview crop in tooltip context. */
+.psv-tooltip .pd-hotspot-preview img,
+.psv-tooltip-content .pd-hotspot-preview img {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+  object-position: center center !important;
+  transform: scale(1.32) !important;
+  opacity: 0.85 !important;
+  display: block !important;
+}
+
+.psv-tooltip .pd-hotspot-preview .pd-hotspot-preview-bg,
+.psv-tooltip-content .pd-hotspot-preview .pd-hotspot-preview-bg {
+  background-size: 220% auto !important;
+  background-position: center center !important;
+  transform: none !important;
+  transform-origin: center center !important;
+  opacity: 0.85 !important;
+}
+
+.pd-hotspot-preview-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 12px;
+  text-align: center;
+  padding: 8px;
+}
+
+.pd-hotspot-preview-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.pd-hotspot-preview-chip {
+  width: var(--pd-preview-thumb-width, 108px);
+  height: calc(var(--pd-preview-thumb-width, 108px) * 0.6);
+  border-radius: 10px;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  background: rgba(15, 23, 42, 0.85);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.34);
+}
+
+.pd-hotspot-thumb {
+  width: 100%;
+  height: 100%;
+}
+
+.pd-hotspot-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center center;
+  transform: scale(1.32);
+  opacity: 0.85;
+  display: block;
+}
+
+.pd-hotspot-thumb-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 11px;
+  padding: 6px;
+  text-align: center;
+}
+
+.pd-hotspot-preview-wrap .pd-hotspot-preview-chip {
+  cursor: pointer;
+}
+
+/* Editor-mode hotspot: chip floats above icon, out of flow so it doesn't shift the anchor */
+.pd-editor-hover-wrap {
+  position: relative;
+}
+.pd-editor-hover-wrap .pd-hotspot-preview-chip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.pd-hotspot-wrap:hover .pd-editor-hover-wrap .pd-hotspot-preview-chip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+.pd-hotspot-preview-icon {
+  pointer-events: none;
+}
+
+.pd-preview-nav-hotspot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.pd-preview-nav-thumb {
+  width: 110px;
+  height: 66px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+  background: rgba(15, 23, 42, 0.82);
+}
+
+.pd-preview-nav-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center center;
+  transform: scale(1.32);
+  opacity: 0.85;
+  display: block;
+}
+
+.pd-preview-nav-thumb-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 11px;
+  text-align: center;
+  padding: 6px;
+}
+
+.pd-preview-nav-dot {
+  width: 28px;
+  height: 28px;
+  border-radius: 9999px;
+  background: #fff;
+  border: 2px solid rgba(15, 23, 42, 0.35);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.3);
+}
+
+.pd-return-placement-marker {
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  background: #0ea5e9;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 6px rgba(14, 165, 233, 0.2), 0 8px 16px rgba(0, 0, 0, 0.4);
+}
+
+.pd-return-crosshair {
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+  filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.35));
+}
+
+.pd-return-crosshair-h {
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.pd-return-crosshair-v {
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.pd-return-modal {
+  box-shadow: inset 0 1px 0 rgba(56, 189, 248, 0.25), 0 24px 48px rgba(0, 0, 0, 0.5);
+}
+
+.pd-return-horizon {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  border-top: 3px dashed rgba(255, 255, 255, 0.55);
+  transform: translateY(-50%);
+  pointer-events: none;
+  z-index: 4;
+  filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.32));
+}
+
+.pd-return-scene-name {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: clamp(20px, 2.1vw, 38px);
+  line-height: 1.1;
+  letter-spacing: 0.01em;
+  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+  z-index: 4;
+}
+
+/* Hide Photo Sphere default loading bubble/text for cleaner walkthrough transitions */
+.psv-loader,
+.psv-loader-container,
+.psv-loader-text {
+  display: none !important;
+  opacity: 0 !important;
+}
+
+/* ── Wall-ring hotspot (pd-whs) ───────────────────────────────────────────── */
+.pd-whs-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--pd-whs-size, 90px);
+  height: var(--pd-whs-size, 90px);
+  transform: scale(1);
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.55));
+  transition: transform 240ms cubic-bezier(0.34, 1.28, 0.64, 1), filter 240ms ease;
+}
+
+.pd-hotspot-wrap {
+  touch-action: manipulation;
+}
+
+.pd-floor-hotspot-hit {
+  position: relative;
+  width: var(--pd-floor-hit-size, 46px);
+  height: var(--pd-floor-hit-size, 46px);
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.01);
+  transform: translateZ(0);
+}
+
+.pd-floor-hotspot-hit::before,
+.pd-floor-hotspot-hit::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  border-radius: 9999px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.pd-floor-hotspot-hit::before {
+  width: max(9px, calc(var(--pd-floor-hit-size, 46px) * 0.18));
+  height: max(9px, calc(var(--pd-floor-hit-size, 46px) * 0.18));
+  background: var(--pd-floor-hit-color, rgba(255, 255, 255, 0.96));
+  box-shadow:
+    0 0 0 3px rgba(15, 23, 42, 0.28),
+    0 0 14px 4px var(--pd-floor-hit-glow, rgba(255, 255, 255, 0.7));
+  animation: pd-floor-hit-core var(--pd-floor-hit-speed, 2.4s) ease-in-out infinite;
+}
+
+.pd-floor-hotspot-hit::after {
+  width: calc(var(--pd-floor-hit-size, 46px) * 0.56);
+  height: calc(var(--pd-floor-hit-size, 46px) * 0.56);
+  border: 2px solid var(--pd-floor-hit-color, rgba(255, 255, 255, 0.86));
+  opacity: 0;
+  animation: pd-floor-hit-ping var(--pd-floor-hit-speed, 2.4s) ease-out infinite;
+}
+
+.pd-floor-projected-ring {
+  cursor: pointer;
+  vector-effect: non-scaling-stroke;
+  shape-rendering: geometricPrecision;
+}
+
+.pd-floor-projected-ring-core {
+  animation: pd-floor-projected-core 2.4s ease-in-out infinite;
+}
+
+.pd-floor-projected-ring-ping {
+  animation: pd-floor-projected-ping 2.4s ease-out infinite;
+}
+
+@keyframes pd-floor-hit-core {
+  0%, 100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 0.66; transform: translate(-50%, -50%) scale(0.72); }
+}
+
+@keyframes pd-floor-hit-ping {
+  0% { opacity: 0.7; transform: translate(-50%, -50%) scale(0.58); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.65); }
+}
+
+@keyframes pd-floor-projected-core {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.58; }
+}
+
+@keyframes pd-floor-projected-ping {
+  0% { opacity: 0; }
+  12% { opacity: 0.72; }
+  100% { opacity: 0; }
+}
+
+.pd-hotspot-wrap:hover .pd-whs-wrap,
+.pd-hotspot-wrap:focus-within .pd-whs-wrap {
+  transform: scale(1.11);
+  filter: drop-shadow(0 0 14px rgba(255, 255, 255, 0.48));
+}
+
+.pd-whs-halo {
+  position: absolute;
+  inset: -12%;
+  border-radius: 9999px;
+  background: radial-gradient(circle, rgba(var(--pd-whs-r,255),var(--pd-whs-g,255),var(--pd-whs-b,255),0.18) 0%, transparent 68%);
+  animation: pd-whs-glow var(--pd-whs-speed, 2.6s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-whs-ring {
+  position: absolute;
+  width: 70%;
+  height: 70%;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  overflow: visible;
+  animation: pd-whs-ring-pulse var(--pd-whs-speed, 2.6s) ease-in-out infinite;
+  pointer-events: none;
+}
+
+.pd-whs-ping {
+  position: absolute;
+  width: 70%;
+  height: 70%;
+  border-radius: 9999px;
+  border: max(1px, calc(var(--pd-whs-border, 2px) * 0.75)) solid rgba(var(--pd-whs-r,255),var(--pd-whs-g,255),var(--pd-whs-b,255),0.65);
+  opacity: 0;
+  pointer-events: none;
+  animation: pd-whs-ping var(--pd-whs-speed, 2.6s) ease-out infinite;
+}
+
+.pd-whs-icon {
+  position: relative;
+  z-index: 10;
+  font-size: calc(var(--pd-whs-size, 90px) * 0.26);
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 1px 5px rgba(0,0,0,0.9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  pointer-events: none;
+}
+
+@keyframes pd-whs-glow {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+
+@keyframes pd-whs-ring-pulse {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 5px rgba(var(--pd-whs-r,255),var(--pd-whs-g,255),var(--pd-whs-b,255),0.45));
+  }
+  50% {
+    opacity: 0.6;
+    filter: drop-shadow(0 0 11px rgba(var(--pd-whs-r,255),var(--pd-whs-g,255),var(--pd-whs-b,255),0.65));
+  }
+}
+
+@keyframes pd-whs-ping {
+  0% { transform: scale(1); opacity: 0.75; }
+  80%, 100% { transform: scale(2.3); opacity: 0; }
+}
+
+.pd-hotspot-mini-label-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.pd-hotspot-mini-label {
+  padding: 6px 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(10, 18, 36, 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: rgba(255, 255, 255, 0.94);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  box-shadow: 0 8px 24px rgba(2, 6, 23, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* Always-show label toggle: .pd-always-label is hidden by default, shown when container has .pd-labels-visible */
+.pd-always-label {
+  display: none;
+}
+
+.pd-labels-visible .pd-always-label {
+  display: flex;
+}
+
+@keyframes progress {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(0%); }
+  100% { transform: translateX(100%); }
+}

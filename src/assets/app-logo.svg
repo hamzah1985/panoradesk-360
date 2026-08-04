@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="PanoraDesk 360 logo">
+  <defs>
+    <linearGradient id="pd-bg" x1="90" y1="80" x2="910" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1E3149"/>
+      <stop offset="0.48" stop-color="#0E2038"/>
+      <stop offset="1" stop-color="#04152A"/>
+    </linearGradient>
+    <radialGradient id="pd-core" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(512 510) rotate(90) scale(286)">
+      <stop offset="0" stop-color="#071427"/>
+      <stop offset="1" stop-color="#0B1B31"/>
+    </radialGradient>
+    <linearGradient id="pd-ring" x1="236" y1="198" x2="800" y2="824" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#35D5FF"/>
+      <stop offset="0.53" stop-color="#2E95FF"/>
+      <stop offset="1" stop-color="#6B53FF"/>
+    </linearGradient>
+    <linearGradient id="pd-play" x1="463" y1="404" x2="592" y2="626" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F9FBFF"/>
+      <stop offset="1" stop-color="#C9D3E8"/>
+    </linearGradient>
+    <filter id="pd-soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="26" flood-color="#000000" flood-opacity=".38"/>
+    </filter>
+  </defs>
+
+  <rect x="24" y="24" width="976" height="976" rx="220" fill="url(#pd-bg)"/>
+  <circle cx="512" cy="512" r="262" fill="url(#pd-core)"/>
+
+  <path
+    d="M 300 808 L 300 472 A 250 250 0 1 1 748 334"
+    fill="none"
+    stroke="url(#pd-ring)"
+    stroke-width="96"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    filter="url(#pd-soft-shadow)"
+  />
+
+  <path d="M 678 292 L 832 344 L 730 452 Z" fill="url(#pd-ring)" filter="url(#pd-soft-shadow)"/>
+
+  <path d="M 472 397 L 472 627 L 654 512 Z" fill="url(#pd-play)" filter="url(#pd-soft-shadow)"/>
+</svg>
