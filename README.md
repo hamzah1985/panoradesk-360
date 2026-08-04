@@ -107,9 +107,27 @@ panoradesk360-<tour-name>/
 
 Upload the folder to any static host. Because `fetch()` is blocked on `file://` URLs, opening `index.html` directly from disk will not work — serve it over HTTP (`python -m http.server` is enough for a local check).
 
-## Contributing
+## Contributing — take it and run
 
-Issues and pull requests are welcome. Please make sure `npm run lint` passes and that a build still completes before opening a PR.
+This started as a personal project and it's open source now because it's more
+useful to other people than sitting on a hard drive. Treat it as yours:
+
+- **Fork it, strip it, rebrand it, sell it.** The MIT licence means you don't
+  need to ask, and you don't owe anything back.
+- **Point AI agents at it.** The codebase is deliberately agent-friendly —
+  plain TypeScript and CommonJS, no build magic, no code generation, and the
+  architecture notes above exist so a coding agent can orient itself fast. If
+  you want to rip out a subsystem or rewrite the exporter with Claude Code,
+  Cursor, or anything else, go ahead. That's a legitimate way to use this.
+- **Bad code is fine.** Half-working PRs, rough edges, and "I got an agent to
+  do this and it seems to work" are all more welcome than nothing.
+
+Two things worth doing before opening a PR: `npm run lint` should pass, and
+`npm run electron:build` should still produce an installer. Beyond that, don't
+overthink it.
+
+If you build something interesting on top of this, an issue linking to it would
+be genuinely nice to see.
 
 ## License
 
