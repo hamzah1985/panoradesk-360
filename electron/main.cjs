@@ -33,7 +33,43 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 const isDev = !app.isPackaged;
-const PROJECTS_ROOT = path.join(app.getPath('documents'), 'PanoraDesk360', 'projects');
+
+// Windows' Documents folder is frequently redirected into OneDrive by its
+// "Back up your folders" feature. Storing tours there means every panorama is
+// synced to the user's cloud quota, and — worse — Files On-Demand can evict
+// them to placeholders, so reads turn into network recalls that stall or fail
+// offline. Keep tour data on a local, never-synced path in that case.
+function isCloudSyncedPath(candidate) {
+  const normalized = String(candidate || '').replace(/\\/g, '/').toLowerCase();
+  if (!normalized) return false;
+  return /(^|\/)onedrive[^/]*\//.test(`${normalized}/`)
+    || /(^|\/)(dropbox|google drive|googledrive|icloud ?drive|creative cloud files)\//.test(`${normalized}/`);
+}
+
+function resolveDataHome() {
+  let documents = '';
+  try { documents = app.getPath('documents'); } catch { documents = ''; }
+  if (documents && !isCloudSyncedPath(documents)) return path.join(documents, 'PanoraDesk360');
+  // Fall back to the profile root: still easy for the user to find and back up,
+  // but outside any synced known folder.
+  return path.join(app.getPath('home'), 'PanoraDesk360');
+}
+
+// Where new tours are written.
+const DATA_HOME = resolveDataHome();
+const PROJECTS_ROOT = path.join(DATA_HOME, 'projects');
+
+// Tours created before this fallback existed still live under Documents, so
+// keep that location readable — it is added to the discovery roots below.
+const LEGACY_DATA_HOMES = (() => {
+  const homes = [];
+  try {
+    const documents = app.getPath('documents');
+    if (documents) homes.push(path.join(documents, 'PanoraDesk360'));
+  } catch {}
+  return homes.filter((dir) => path.resolve(dir) !== path.resolve(DATA_HOME));
+})();
+
 const RECENTS_FILE = path.join(app.getPath('userData'), 'recent-projects.json');
 const SCENE_IMPORT_MAX_EDGE = 4096;
 const SCENE_THUMBNAIL_MAX_EDGE = 512;
@@ -50,7 +86,7 @@ const previewServers = new Map();
 let mainWindow = null;
 let allowAppClose = false;
 let appCloseFallbackTimer = null;
-const LOG_DIR = path.join(app.getPath('documents'), 'PanoraDesk360', 'logs');
+const LOG_DIR = path.join(DATA_HOME, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'startup.log');
 async function logLine(message) {
   try {
@@ -187,6 +223,11 @@ async function discoverProjectDirs() {
 async function scanForProjectDirs() {
   const roots = new Set();
   roots.add(path.resolve(PROJECTS_ROOT));
+  // Tours created before the cloud-sync fallback still live under the old
+  // Documents path — keep them visible in the dashboard.
+  for (const legacyHome of LEGACY_DATA_HOMES) {
+    roots.add(path.resolve(path.join(legacyHome, 'projects')));
+  }
   try { roots.add(path.resolve(app.getPath('documents'))); } catch {}
   try { roots.add(path.resolve(app.getPath('desktop'))); } catch {}
 
