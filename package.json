@@ -1,7 +1,7 @@
 {
   "name": "panoradesk-360",
   "productName": "PanoraDesk 360",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Desktop editor for building interactive 360° virtual tours from panorama photos, exporting self-contained websites that run offline.",
   "keywords": [
@@ -12,13 +12,13 @@
     "electron",
     "equirectangular"
   ],
-  "homepage": "https://github.com/YOUR-GITHUB-USERNAME/panoradesk-360",
+  "homepage": "https://github.com/hamzah1985/panoradesk-360",
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR-GITHUB-USERNAME/panoradesk-360.git"
+    "url": "https://github.com/hamzah1985/panoradesk-360.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR-GITHUB-USERNAME/panoradesk-360/issues"
+    "url": "https://github.com/hamzah1985/panoradesk-360/issues"
   },
   "license": "MIT",
   "author": "PanoraDesk",

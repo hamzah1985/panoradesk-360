@@ -16,7 +16,12 @@ Windows desktop app built with Electron, React, and [Photo Sphere Viewer](https:
 - Export a website-ready folder or ZIP — **no CDN, no internet required at runtime**
 - Deploy directly into an existing website folder
 
-Projects are plain folders under `Documents/PanoraDesk360/projects/`, with a human-readable `project.json` you can edit or version-control.
+Projects are plain folders with a human-readable `project.json` you can edit or
+version-control. They live under `Documents/PanoraDesk360/projects/` — unless
+Windows has redirected Documents into OneDrive (or another sync client), in
+which case the app falls back to `<your-profile>/PanoraDesk360/projects/`.
+Tours are large binary data, and cloud sync can evict panoramas to placeholders
+that then fail to load offline.
 
 ## Install
 
@@ -27,7 +32,7 @@ Download the latest `PanoraDesk 360 Setup <version>.exe` from the [Releases](../
 Requires Node.js 20 or newer.
 
 ```bash
-git clone https://github.com/YOUR-GITHUB-USERNAME/panoradesk-360.git
+git clone https://github.com/hamzah1985/panoradesk-360.git
 cd panoradesk-360
 npm install          # `prepare` builds the viewer bundle automatically
 npm run electron:dev # run the app in development
