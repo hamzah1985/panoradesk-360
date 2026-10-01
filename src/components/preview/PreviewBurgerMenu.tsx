@@ -3,7 +3,7 @@ import { Project } from '../../types';
 import { resolveAssetSrc } from '../../lib/media';
 import {
   Menu, X, Map as MapIcon, Eye, EyeOff, Expand, Minimize2, Compass,
-  GalleryHorizontal, ChevronLeft, ChevronRight, ZoomIn, Images, Upload,
+  GalleryHorizontal, ChevronLeft, ChevronRight, ZoomIn, Images,
 } from 'lucide-react';
 
 type Props = {
@@ -23,7 +23,10 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
   const [sceneThumbs, setSceneThumbs] = React.useState<Record<string, string>>({});
 
   const hasFloorPlan = !!project.floorPlanImage;
-  const galleryImages = project.galleryImages ?? [];
+  const galleryImages = React.useMemo(
+    () => (project.galleryImages ?? []).map((src) => resolveAssetSrc(project, src)).filter(Boolean),
+    [project, project.galleryImages],
+  );
   const pinnedScenes = React.useMemo(
     () => project.scenes.filter((scene) => !!scene.floorPlan),
     [project.scenes],
@@ -45,15 +48,30 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
   }, []);
 
   React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      if (lightboxIndex !== null) { setLightboxIndex(null); return; }
-      if (galleryOpen) { setGalleryOpen(false); return; }
-      if (floorPlanOpen) { setFloorPlanOpen(false); return; }
+    const onCloseTopOverlay = (event: Event) => {
+      if (lightboxIndex !== null) {
+        event.preventDefault();
+        setLightboxIndex(null);
+        return;
+      }
+      if (galleryOpen) {
+        event.preventDefault();
+        setGalleryOpen(false);
+        return;
+      }
+      if (floorPlanOpen) {
+        event.preventDefault();
+        setFloorPlanOpen(false);
+        return;
+      }
+      if (menuOpen) {
+        event.preventDefault();
+        setMenuOpen(false);
+      }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [lightboxIndex, galleryOpen, floorPlanOpen]);
+    window.addEventListener('preview-close-top-overlay', onCloseTopOverlay);
+    return () => window.removeEventListener('preview-close-top-overlay', onCloseTopOverlay);
+  }, [lightboxIndex, galleryOpen, floorPlanOpen, menuOpen]);
 
   const navigateScene = React.useCallback((sceneId: string) => {
     window.dispatchEvent(new CustomEvent('preview-navigate-scene', { detail: { sceneId } }));
@@ -65,6 +83,16 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
     let alive = true;
     const makeCompressedThumb = async (src: string) => new Promise<string>((resolve) => {
       const img = new Image();
+      let settled = false;
+      let timeoutId: number | null = null;
+      const finish = (value: string) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
+        img.onload = null;
+        img.onerror = null;
+        resolve(value);
+      };
       img.decoding = 'async';
       img.loading = 'eager';
       img.onload = () => {
@@ -74,29 +102,32 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
           canvas.width = side;
           canvas.height = side;
           const ctx = canvas.getContext('2d');
-          if (!ctx) { resolve(src); return; }
+          if (!ctx) { finish(src); return; }
           const sourceSide = Math.min(img.naturalWidth, img.naturalHeight);
           const sx = Math.max(0, Math.floor((img.naturalWidth - sourceSide) / 2));
           const sy = Math.max(0, Math.floor((img.naturalHeight - sourceSide) / 2));
           ctx.drawImage(img, sx, sy, sourceSide, sourceSide, 0, 0, side, side);
-          resolve(canvas.toDataURL('image/jpeg', 0.42));
+          finish(canvas.toDataURL('image/jpeg', 0.42));
         } catch {
-          resolve(src);
+          finish(src);
         }
       };
-      img.onerror = () => resolve(src);
+      img.onerror = () => finish(src);
+      timeoutId = window.setTimeout(() => finish(src), 8_000);
       img.src = src;
     });
 
     const buildThumbs = async () => {
-      const entries = await Promise.all(project.scenes.map(async (scene) => {
+      setSceneThumbs({});
+      await Promise.all(project.scenes.map(async (scene) => {
         const src = resolveAssetSrc(project, scene.thumbnail || scene.image);
-        if (!src) return [scene.id, ''] as const;
+        if (!src) return;
         const compressed = await makeCompressedThumb(src);
-        return [scene.id, compressed] as const;
+        if (!alive) return;
+        // Commit independently so one slow or broken remote thumbnail cannot
+        // hold back every other scene in the menu.
+        setSceneThumbs((current) => ({ ...current, [scene.id]: compressed }));
       }));
-      if (!alive) return;
-      setSceneThumbs(Object.fromEntries(entries));
     };
     void buildThumbs();
     return () => { alive = false; };
@@ -109,7 +140,10 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
       {/* Burger button */}
       <button
         type="button"
-        onClick={() => setMenuOpen((prev) => !prev)}
+        onClick={() => {
+          if (!menuOpen) window.dispatchEvent(new Event('preview-dismiss-info-marker'));
+          setMenuOpen((prev) => !prev);
+        }}
         className="absolute top-6 right-6 z-50 h-11 w-11 rounded-xl border border-white/10 bg-black/50 text-white backdrop-blur-md transition hover:bg-black/70 shadow-lg"
         title={menuOpen ? 'Close menu' : 'Open menu'}
         aria-label={menuOpen ? 'Close menu' : 'Open menu'}
@@ -125,7 +159,7 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
             className="absolute inset-0 z-40"
             onClick={() => setMenuOpen(false)}
           />
-          <div className="absolute top-0 right-0 z-50 h-full w-80 bg-black/70 backdrop-blur-xl border-l border-white/10 shadow-2xl flex flex-col">
+          <div data-preview-overlay className="absolute top-0 right-0 z-50 h-full w-80 bg-black/70 backdrop-blur-xl border-l border-white/10 shadow-2xl flex flex-col">
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-white/10 flex-shrink-0">
               <div className="text-xs font-bold uppercase tracking-widest text-white/50">Menu</div>
@@ -284,7 +318,7 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
 
       {/* Floor Plan overlay */}
       {floorPlanOpen && (
-        <div className="absolute inset-0 z-[60] bg-black/60 backdrop-blur-sm p-6">
+        <div data-preview-overlay className="absolute inset-0 z-[60] bg-black/60 backdrop-blur-sm p-6">
           <div className="mx-auto flex h-full max-h-[86vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-white/15 bg-black/75 text-white shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-3.5 flex-shrink-0">
               <div className="flex items-center gap-2.5">
@@ -330,7 +364,7 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
 
       {/* Gallery overlay */}
       {galleryOpen && (
-        <div className="absolute inset-0 z-[60] bg-black/80 backdrop-blur-md flex flex-col">
+        <div data-preview-overlay className="absolute inset-0 z-[60] bg-black/80 backdrop-blur-md flex flex-col">
           {/* Gallery header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-white/10 flex-shrink-0">
             <div className="flex items-center gap-3">
@@ -387,7 +421,7 @@ const PreviewBurgerMenu: React.FC<Props> = ({ project, currentSceneId, isFullscr
 
       {/* Lightbox */}
       {lightboxIndex !== null && galleryImages.length > 0 && (
-        <div className="absolute inset-0 z-[70] bg-black/95 flex flex-col">
+        <div data-preview-overlay className="absolute inset-0 z-[70] bg-black/95 flex flex-col">
           <div className="flex items-center justify-between px-6 py-4 flex-shrink-0">
             <span className="text-sm text-white/50 tabular-nums">{lightboxIndex + 1} / {galleryImages.length}</span>
             <button

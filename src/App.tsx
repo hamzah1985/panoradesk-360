@@ -4,7 +4,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { useProjectStore } from './store/projectStore';
+import { hasPendingProjectOperations, useProjectStore } from './store/projectStore';
 import { AppMode } from './types';
 import Dashboard from './components/dashboard/Dashboard';
 import AppShell from './components/layout/AppShell';
@@ -13,6 +13,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import ToastHost from './components/ui/ToastHost';
 import ConfirmDialog from './components/ui/ConfirmDialog';
 import { useUiStore } from './store/uiStore';
+import { hasEscapeCloseLayer } from './hooks/useEscapeClose';
 
 function autosaveFingerprint(project: any) {
   if (!project) return '';
@@ -32,17 +33,35 @@ export default function App() {
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let inFlight: Promise<void> | null = null;
-    let lastSavedFingerprint = autosaveFingerprint(useProjectStore.getState().project);
-    let lastProjectId = useProjectStore.getState().project?.id ?? null;
+    const initialState = useProjectStore.getState();
+    const initialFingerprint = autosaveFingerprint(initialState.project);
+    let lastSavedFingerprint = initialState.project
+      && initialState.savedModifiedDate === initialState.project.modifiedDate
+      ? initialFingerprint
+      : '';
+    let lastObservedFingerprint = initialFingerprint;
+    let lastProjectId = initialState.project?.id ?? null;
+    let projectEpoch = 0;
+    let observedSaveState = initialState.saveState;
     const api = typeof window !== 'undefined' ? window.electronAPI : undefined;
 
     const performSave = async () => {
       const project = useProjectStore.getState().project;
       if (!project) return;
+      const saveProjectId = project.id;
+      const saveEpoch = projectEpoch;
       const fingerprint = autosaveFingerprint(project);
       if (!fingerprint || fingerprint === lastSavedFingerprint) return;
       await useProjectStore.getState().saveProject();
-      lastSavedFingerprint = fingerprint;
+      // A save started for a previous editor session may finish after another
+      // project (even the same project ID reopened) has become active.
+      if (
+        projectEpoch === saveEpoch
+        && useProjectStore.getState().project?.id === saveProjectId
+        && autosaveFingerprint(useProjectStore.getState().project) === fingerprint
+      ) {
+        lastSavedFingerprint = fingerprint;
+      }
     };
 
     // Resolves only when there is nothing left to write. The previous version
@@ -56,42 +75,77 @@ export default function App() {
       return inFlight;
     };
 
+    const scheduleSave = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void runSave().catch(() => {});
+      }, 700);
+    };
+
     const unsubscribe = useProjectStore.subscribe((state) => {
+      const saveJustSucceeded = state.saveState === 'saved' && observedSaveState !== 'saved';
+      observedSaveState = state.saveState;
       const project = state.project;
       if (!project) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        projectEpoch += 1;
         lastProjectId = null;
-        return;
-      }
-      // A freshly opened/created project already matches what's on disk, so adopt
-      // it as the saved baseline rather than firing a redundant save that just
-      // rewrites modifiedDate.
-      if (project.id !== lastProjectId) {
-        lastProjectId = project.id;
-        lastSavedFingerprint = autosaveFingerprint(project);
+        lastSavedFingerprint = '';
+        lastObservedFingerprint = '';
         return;
       }
       const nextFingerprint = autosaveFingerprint(project);
-      if (nextFingerprint === lastSavedFingerprint) return;
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        void runSave();
-      }, 700);
+
+      if (project.id !== lastProjectId) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        projectEpoch += 1;
+        lastProjectId = project.id;
+        lastObservedFingerprint = nextFingerprint;
+        lastSavedFingerprint = state.savedModifiedDate === project.modifiedDate
+          ? nextFingerprint
+          : '';
+        if (nextFingerprint !== lastSavedFingerprint) scheduleSave();
+        return;
+      }
+
+      // Successful manual and initial saves also establish the autosave
+      // baseline, but only if no edits landed while that snapshot was writing.
+      if (saveJustSucceeded) {
+        lastSavedFingerprint = nextFingerprint;
+        lastObservedFingerprint = nextFingerprint;
+        if (timer) { clearTimeout(timer); timer = null; }
+        return;
+      }
+
+      // saveState/lastSavedAt updates do not represent new content. Scheduling
+      // only on fingerprint changes avoids an endless retry loop after an error.
+      if (nextFingerprint === lastObservedFingerprint) return;
+      lastObservedFingerprint = nextFingerprint;
+      if (nextFingerprint === lastSavedFingerprint) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        return;
+      }
+      scheduleSave();
     });
 
     // In Electron, any non-undefined returnValue cancels the close outright —
     // no prompt. The desktop build already flushes through the IPC handshake
     // below, so blocking here would just wedge the window open.
-    const hasCloseHandshake = !!(api?.onFlushBeforeClose && api?.confirmClose);
+    const hasCloseHandshake = !!(api?.onFlushBeforeClose && api?.confirmClose && api?.cancelClose);
 
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (timer) clearTimeout(timer);
+      if (timer) { clearTimeout(timer); timer = null; }
       const project = useProjectStore.getState().project;
-      const hasUnsaved = !!project && autosaveFingerprint(project) !== lastSavedFingerprint;
+      const hasUnsaved = !!project && (
+        autosaveFingerprint(project) !== lastSavedFingerprint
+        || hasPendingProjectOperations(project.id)
+      );
       if (hasUnsaved && !hasCloseHandshake) {
         e.preventDefault();
         e.returnValue = '';
       }
-      void runSave();
+      void useProjectStore.getState().flushProject().catch(() => {});
     };
 
     window.addEventListener('beforeunload', handleBeforeUnload);
@@ -99,13 +153,17 @@ export default function App() {
     // Electron: flush any pending/in-flight save before the window actually
     // closes so the last edits (still inside the 700ms debounce) aren't lost.
     let offFlush: (() => void) | undefined;
-    if (api?.onFlushBeforeClose && api.confirmClose) {
-      offFlush = api.onFlushBeforeClose(async () => {
+    if (api?.onFlushBeforeClose && api.confirmClose && api.cancelClose) {
+      offFlush = api.onFlushBeforeClose(async (requestId) => {
         try {
-          if (timer) clearTimeout(timer);
-          await runSave();
-        } finally {
-          try { await api.confirmClose!(); } catch {}
+          if (timer) { clearTimeout(timer); timer = null; }
+          await useProjectStore.getState().flushProject();
+          await api.confirmClose!(requestId);
+        } catch {
+          // saveProject already exposes the error through saveState. Do not
+          // confirm the close when the flush failed, or unsaved edits are lost.
+          useUiStore.getState().pushToast('error', 'Could not save the project, so the window was kept open. Fix the save error and try closing again.');
+          try { await api.cancelClose!(requestId); } catch {}
         }
       });
     }
@@ -124,6 +182,9 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (useUiStore.getState().confirm.open) return;
+      if (hasEscapeCloseLayer()) return;
+      if (useProjectStore.getState().currentMode !== AppMode.EDITOR) return;
       const active = document.activeElement as HTMLElement | null;
       const tag = (active?.tagName || '').toUpperCase();
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;

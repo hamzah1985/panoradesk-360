@@ -40,10 +40,82 @@ interface ProjectState {
   redo: () => void;
   canUndo: () => boolean;
   canRedo: () => boolean;
+  clearHistory: () => void;
   saveProject: () => Promise<void>;
+  flushProject: () => Promise<void>;
 }
 
 const LS_KEY = 'panoradesk_projects';
+
+// All renderer save entry points share this queue. Without it, autosave,
+// Ctrl/Cmd+S, and the top-bar button can write snapshots concurrently and an
+// older request that happens to finish last can replace newer project data.
+let saveQueue: Promise<void> = Promise.resolve();
+let saveRequestSequence = 0;
+let activeProjectSession = 0;
+const latestSaveRequestByProject = new Map<string, { requestId: number; session: number }>();
+const pendingSnapshotSaves = new WeakMap<Project, { session: number; promise: Promise<void> }>();
+const deletingProjectIds = new Set<string>();
+let projectOperationSequence = 0;
+const pendingProjectOperations = new Map<number, {
+  projectId: string;
+  session: number;
+  promise: Promise<unknown>;
+}>();
+
+export type ProjectSessionToken = Readonly<{ projectId: string; session: number }>;
+
+export function captureProjectSession(projectId: string): ProjectSessionToken {
+  return { projectId, session: activeProjectSession };
+}
+
+export function ownsProjectSession(owner: ProjectSessionToken) {
+  return owner.session === activeProjectSession
+    && useProjectStore.getState().project?.id === owner.projectId;
+}
+
+export function runProjectOperation<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
+  const operationId = ++projectOperationSequence;
+  const session = activeProjectSession;
+  // Deferring the callback by one microtask lets us publish the registry entry
+  // before any asynchronous operation can mutate the live project.
+  const promise = Promise.resolve().then(operation);
+  pendingProjectOperations.set(operationId, { projectId, session, promise });
+  const clear = () => {
+    const pending = pendingProjectOperations.get(operationId);
+    if (pending?.promise === promise) pendingProjectOperations.delete(operationId);
+  };
+  void promise.then(clear, clear);
+  return promise;
+}
+
+export function hasPendingProjectOperations(projectId: string) {
+  return Array.from(pendingProjectOperations.values()).some((pending) => (
+    pending.projectId === projectId && pending.session === activeProjectSession
+  ));
+}
+
+async function waitForProjectOperations(projectId: string, session: number) {
+  while (true) {
+    const operations = Array.from(pendingProjectOperations.values())
+      .filter((pending) => pending.projectId === projectId && pending.session === session)
+      .map((pending) => pending.promise);
+    if (operations.length === 0) return;
+    await Promise.all(operations);
+  }
+}
+
+// Content fingerprint of the project as last loaded or successfully saved in the
+// current session. flushProject uses it to skip writes when nothing changed.
+let savedContentBaseline: { session: number; projectId: string; fingerprint: string } | null = null;
+
+function persistedProjectFingerprint(project: Project) {
+  // The desktop save assigns the canonical folder and write timestamp. Those
+  // are save results, not unsaved editor content, so they must not cause the
+  // flush loop to write the same snapshot a second time.
+  const { modifiedDate: _modifiedDate, path: _path, ...content } = project;
+  return JSON.stringify(content);
+}
 
 function defaultExportSettings(title: string) {
   return {
@@ -76,7 +148,20 @@ async function listProjectsFallback(): Promise<Project[]> {
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as Project[]) : [];
+    if (!Array.isArray(parsed)) return [];
+    const seenIds = new Set<string>();
+    let changed = false;
+    const projects = (parsed as Project[]).map((project) => {
+      let id = String(project?.id || '');
+      if (!id || seenIds.has(id)) {
+        id = uuidv4();
+        changed = true;
+      }
+      seenIds.add(id);
+      return id === project.id ? project : { ...project, id };
+    });
+    if (changed) localStorage.setItem(LS_KEY, JSON.stringify(projects));
+    return projects;
   } catch {
     return [];
   }
@@ -98,14 +183,28 @@ export async function listProjects(): Promise<Project[]> {
 }
 
 export async function deleteProject(projectId: string, projectPath?: string): Promise<boolean> {
-  const desktop = getDesktopApi();
-  if (desktop) return desktop.deleteProject(projectId, projectPath);
-  const projects = await listProjectsFallback();
-  const next = projects.filter((p) => p.id !== projectId);
-  const removed = next.length !== projects.length;
-  if (!removed) return false;
-  localStorage.setItem(LS_KEY, JSON.stringify(next));
-  return removed;
+  if (deletingProjectIds.has(projectId)) return false;
+  deletingProjectIds.add(projectId);
+  let removed = false;
+  try {
+    const runDelete = async () => {
+      const desktop = getDesktopApi();
+      if (desktop) return desktop.deleteProject(projectId, projectPath);
+      const projects = await listProjectsFallback();
+      const next = projects.filter((p) => p.id !== projectId);
+      if (next.length === projects.length) return false;
+      localStorage.setItem(LS_KEY, JSON.stringify(next));
+      return true;
+    };
+    const deletePromise = saveQueue.then(runDelete, runDelete);
+    saveQueue = deletePromise.then(() => {}, () => {});
+    removed = await deletePromise;
+    return removed;
+  } finally {
+    // Keep a successfully deleted ID blocked so a stale component cannot
+    // recreate it. Failed/cancelled deletion remains retryable.
+    if (!removed) deletingProjectIds.delete(projectId);
+  }
 }
 
 export async function openProjectFromDialog(): Promise<Project | null> {
@@ -146,24 +245,53 @@ export async function getInlinePreviewUrl(project: Project, options: ExportOptio
   return result?.url ?? null;
 }
 
+export async function releaseInlinePreview(): Promise<void> {
+  const desktop = getDesktopApi();
+  if (!desktop?.releaseInlinePreview) return;
+  try {
+    await desktop.releaseInlinePreview();
+  } catch {
+    // Best-effort lifecycle cleanup. The main process also removes every live
+    // preview synchronously before quit.
+  }
+}
+
 export async function openPathInFileManager(targetPath: string): Promise<boolean> {
   const desktop = getDesktopApi();
   if (!desktop) return false;
   return desktop.openPathInFileManager(targetPath);
 }
 
-export async function renameProjectInList(projectId: string, newName: string): Promise<boolean> {
-  const desktop = getDesktopApi();
-  // Use the real project list (disk-backed in desktop builds), not the
-  // localStorage-only web fallback — otherwise rename always fails on desktop
-  // because the project is never found.
-  const projects = await listProjects();
-  const project = projects.find((p) => p.id === projectId);
-  if (!project) return false;
-  const updated = { ...project, name: newName.trim() || project.name, modifiedDate: new Date().toISOString() };
+export async function renameProjectInList(projectId: string, newName: string, projectPath?: string): Promise<boolean> {
+  if (deletingProjectIds.has(projectId)) return false;
   try {
-    if (desktop) await desktop.saveProject(updated);
-    else await saveProjectFallback(updated);
+    const persistRename = async () => {
+      if (deletingProjectIds.has(projectId)) throw new Error('Cannot rename a project while it is being deleted.');
+      // Read after earlier editor saves have drained. Reading before awaiting
+      // the queue can merge the new name into a stale full-project snapshot and
+      // overwrite edits that the earlier save just committed.
+      const projects = await listProjects();
+      const normalizedWantedPath = String(projectPath || '').replace(/\\/g, '/').toLowerCase();
+      const project = projects.find((candidate) => {
+        if (candidate.id !== projectId) return false;
+        if (!normalizedWantedPath) return true;
+        return String(candidate.path || '').replace(/\\/g, '/').toLowerCase() === normalizedWantedPath;
+      });
+      if (!project) throw new Error('Project no longer exists.');
+      const updated = {
+        ...project,
+        name: newName.trim() || project.name,
+        modifiedDate: new Date().toISOString(),
+      };
+      const desktop = getDesktopApi();
+      if (desktop) await desktop.saveProject(updated);
+      else await saveProjectFallback(updated);
+    };
+    // Dashboard rename writes use the same renderer queue as editor saves, so
+    // an older editor snapshot cannot arrive after and undo the new name.
+    const renamePromise = saveQueue.then(persistRename, persistRename);
+    saveQueue = renamePromise.catch(() => {});
+    await renamePromise;
     return true;
   } catch {
     return false;
@@ -258,6 +386,7 @@ function normalizeHotspotRingWidth(value: any, fallback = 60) {
 
 function normalizeHotspotNavigationMode(value: any): HotspotNavigationMode {
   const mode = String(value || '').trim().toLowerCase();
+  if (mode === 'original') return 'original';
   if (mode === 'marzipano') return 'marzipano';
   if (mode === 'pannellum') return 'pannellum';
   return 'marzipano';
@@ -452,6 +581,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   lastSavedAt: null,
   setMode: (mode) => set({ currentMode: mode }),
   setProject: (project) => {
+    activeProjectSession += 1;
     if (!project) {
       set({
         project: null,
@@ -475,6 +605,54 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const safeLogo = project.logo ? String(project.logo) : undefined;
     const safeFloorPlanImage = project.floorPlanImage ? String(project.floorPlanImage) : undefined;
     const safeScenes = Array.isArray(project.scenes) ? project.scenes : [];
+    const rawSceneIds = safeScenes.map((scene) => String(scene?.id || '').trim());
+    const usedSceneIds = new Set<string>();
+    for (const rawId of rawSceneIds) {
+      if (!rawId) continue;
+      if (usedSceneIds.has(rawId)) {
+        // A reference to a duplicated scene ID is inherently ambiguous. Do not
+        // guess and silently retarget or delete navigation hotspots.
+        throw new Error(`This project cannot be opened safely because scene ID "${rawId}" is duplicated.`);
+      }
+      usedSceneIds.add(rawId);
+    }
+    const allocateMissingId = (usedIds: Set<string>) => {
+      let nextId = uuidv4();
+      while (usedIds.has(nextId)) nextId = uuidv4();
+      usedIds.add(nextId);
+      return nextId;
+    };
+    const normalizedSceneIds = rawSceneIds.map((rawId) => rawId || allocateMissingId(usedSceneIds));
+    const sceneIdByRawId = new Map<string, string>();
+    const sceneIndexByRawId = new Map<string, number>();
+    rawSceneIds.forEach((rawId, sceneIndex) => {
+      if (!rawId) return;
+      sceneIdByRawId.set(rawId, normalizedSceneIds[sceneIndex]);
+      sceneIndexByRawId.set(rawId, sceneIndex);
+    });
+    const normalizedObjectIds = safeScenes.map((scene) => {
+      const rawHotspots = Array.isArray(scene?.hotspots) ? scene.hotspots : [];
+      const rawMarkers = Array.isArray(scene?.markers) ? scene.markers : [];
+      const rawHotspotIds = rawHotspots.map((hotspot) => String(hotspot?.id || '').trim());
+      const rawMarkerIds = rawMarkers.map((marker) => String(marker?.id || '').trim());
+      const usedObjectIds = new Set<string>();
+      for (const rawId of [...rawHotspotIds, ...rawMarkerIds]) {
+        if (!rawId) continue;
+        if (usedObjectIds.has(rawId)) {
+          throw new Error(
+            `This project cannot be opened safely because object ID "${rawId}" is duplicated in scene "${String(scene?.name || 'Untitled Scene')}".`,
+          );
+        }
+        usedObjectIds.add(rawId);
+      }
+      const hotspotIds = rawHotspotIds.map((rawId) => rawId || allocateMissingId(usedObjectIds));
+      const markerIds = rawMarkerIds.map((rawId) => rawId || allocateMissingId(usedObjectIds));
+      const hotspotIdByRawId = new Map<string, string>();
+      rawHotspotIds.forEach((rawId, hotspotIndex) => {
+        if (rawId) hotspotIdByRawId.set(rawId, hotspotIds[hotspotIndex]);
+      });
+      return { hotspotIds, markerIds, hotspotIdByRawId };
+    });
     const safeExportSettings = {
       ...defaultExportSettings(safeName),
       ...(project.exportSettings || {}),
@@ -513,48 +691,57 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         animation: normalizeHotspotAnimation(safeHotspotStyle.animation),
         opacity: normalizeHotspotOpacity(safeHotspotStyle.opacity),
       },
-      scenes: safeScenes.map((scene) => {
+      scenes: safeScenes.map((scene, sceneIndex) => {
         const rawHotspots = Array.isArray(scene?.hotspots) ? scene.hotspots : [];
         const rawMarkers = Array.isArray(scene?.markers) ? scene.markers : [];
         return {
           ...scene,
-          id: String(scene?.id || uuidv4()),
+          id: normalizedSceneIds[sceneIndex],
           name: String(scene?.name || 'Untitled Scene'),
           image: String(scene?.image || ''),
           thumbnail: String(scene?.thumbnail || scene?.image || ''),
           initialYaw: Number.isFinite(scene?.initialYaw) ? scene.initialYaw : 0,
           initialPitch: Number.isFinite(scene?.initialPitch) ? scene.initialPitch : 0,
           initialZoom: Number.isFinite(scene?.initialZoom) ? scene.initialZoom : 20,
-          hotspots: rawHotspots.map((hotspot) => ({
-            ...hotspot,
-            id: String(hotspot?.id || uuidv4()),
-            linkedHotspotId: hotspot?.linkedHotspotId ? String(hotspot.linkedHotspotId) : undefined,
-            label: String(hotspot?.label || 'Go to...'),
-            targetSceneId: String(hotspot?.targetSceneId || ''),
-            yaw: Number.isFinite(hotspot?.yaw) ? hotspot.yaw : 0,
-            pitch: Number.isFinite(hotspot?.pitch) ? hotspot.pitch : 0,
-            targetYaw: Number.isFinite(hotspot?.targetYaw) ? hotspot.targetYaw : undefined,
-            targetPitch: Number.isFinite(hotspot?.targetPitch) ? hotspot.targetPitch : undefined,
-            transitionType: normalizeTransitionType(hotspot?.transitionType),
-            transitionDuration: normalizeTransitionDuration(hotspot?.transitionDuration),
-            customTargetView: hotspot?.customTargetView === true,
-            navigationMode: normalizeHotspotNavigationMode(hotspot?.navigationMode),
-            entryYaw: Number.isFinite(hotspot?.entryYaw) ? hotspot.entryYaw : undefined,
-            entryPitch: Number.isFinite(hotspot?.entryPitch) ? hotspot.entryPitch : undefined,
-            icon: normalizeHotspotIcon(hotspot?.icon || safeHotspotStyle.iconType),
-            color: hotspot?.color || safeHotspotStyle.color || '#ffffff',
-            size: normalizeHotspotSize(hotspot?.size, safeHotspotStyle.size as any),
-            borderWidth: normalizeHotspotBorderWidth((hotspot as any)?.borderWidth, (safeHotspotStyle as any).borderWidth as any),
-            floorCurve: normalizeHotspotFloorCurve((hotspot as any)?.floorCurve, (safeHotspotStyle as any).floorCurve as any),
-            pulseSpeed: normalizeHotspotPulseSpeed((hotspot as any)?.pulseSpeed, (safeHotspotStyle as any).pulseSpeed as any),
-            ringCount: normalizeHotspotRingCount((hotspot as any)?.ringCount, (safeHotspotStyle as any).ringCount as any),
-            ringWidth: normalizeHotspotRingWidth((hotspot as any)?.ringWidth, (safeHotspotStyle as any).ringWidth as any),
-            animation: normalizeHotspotAnimation(hotspot?.animation),
-            opacity: normalizeHotspotOpacity(hotspot?.opacity),
-          })),
-          markers: rawMarkers.map((marker) => ({
+          hotspots: rawHotspots.map((hotspot, hotspotIndex) => {
+            const rawTargetSceneId = String(hotspot?.targetSceneId || '').trim();
+            const rawLinkedHotspotId = String(hotspot?.linkedHotspotId || '').trim();
+            const targetSceneIndex = sceneIndexByRawId.get(rawTargetSceneId);
+            const normalizedLinkedHotspotId = targetSceneIndex === undefined
+              ? rawLinkedHotspotId
+              : normalizedObjectIds[targetSceneIndex].hotspotIdByRawId.get(rawLinkedHotspotId)
+                ?? rawLinkedHotspotId;
+            return {
+              ...hotspot,
+              id: normalizedObjectIds[sceneIndex].hotspotIds[hotspotIndex],
+              linkedHotspotId: normalizedLinkedHotspotId || undefined,
+              label: String(hotspot?.label || 'Go to...'),
+              targetSceneId: sceneIdByRawId.get(rawTargetSceneId) ?? rawTargetSceneId,
+              yaw: Number.isFinite(hotspot?.yaw) ? hotspot.yaw : 0,
+              pitch: Number.isFinite(hotspot?.pitch) ? hotspot.pitch : 0,
+              targetYaw: Number.isFinite(hotspot?.targetYaw) ? hotspot.targetYaw : undefined,
+              targetPitch: Number.isFinite(hotspot?.targetPitch) ? hotspot.targetPitch : undefined,
+              transitionType: normalizeTransitionType(hotspot?.transitionType),
+              transitionDuration: normalizeTransitionDuration(hotspot?.transitionDuration),
+              customTargetView: hotspot?.customTargetView === true,
+              navigationMode: normalizeHotspotNavigationMode(hotspot?.navigationMode),
+              entryYaw: Number.isFinite(hotspot?.entryYaw) ? hotspot.entryYaw : undefined,
+              entryPitch: Number.isFinite(hotspot?.entryPitch) ? hotspot.entryPitch : undefined,
+              icon: normalizeHotspotIcon(hotspot?.icon || safeHotspotStyle.iconType),
+              color: hotspot?.color || safeHotspotStyle.color || '#ffffff',
+              size: normalizeHotspotSize(hotspot?.size, safeHotspotStyle.size as any),
+              borderWidth: normalizeHotspotBorderWidth((hotspot as any)?.borderWidth, (safeHotspotStyle as any).borderWidth as any),
+              floorCurve: normalizeHotspotFloorCurve((hotspot as any)?.floorCurve, (safeHotspotStyle as any).floorCurve as any),
+              pulseSpeed: normalizeHotspotPulseSpeed((hotspot as any)?.pulseSpeed, (safeHotspotStyle as any).pulseSpeed as any),
+              ringCount: normalizeHotspotRingCount((hotspot as any)?.ringCount, (safeHotspotStyle as any).ringCount as any),
+              ringWidth: normalizeHotspotRingWidth((hotspot as any)?.ringWidth, (safeHotspotStyle as any).ringWidth as any),
+              animation: normalizeHotspotAnimation(hotspot?.animation),
+              opacity: normalizeHotspotOpacity(hotspot?.opacity),
+            };
+          }),
+          markers: rawMarkers.map((marker, markerIndex) => ({
             ...marker,
-            id: String(marker?.id || uuidv4()),
+            id: normalizedObjectIds[sceneIndex].markerIds[markerIndex],
             title: String(marker?.title || 'Info'),
             description: String(marker?.description || ''),
             yaw: Number.isFinite(marker?.yaw) ? marker.yaw : 0,
@@ -576,8 +763,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       savedModifiedDate: linkedProject.modifiedDate,
       lastSavedAt: null,
     });
+    savedContentBaseline = {
+      session: activeProjectSession,
+      projectId: linkedProject.id,
+      fingerprint: persistedProjectFingerprint(linkedProject),
+    };
   },
   createNewProject: (name, path) => {
+    activeProjectSession += 1;
     const nowIso = new Date().toISOString();
     set({
       project: {
@@ -600,13 +793,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       currentSceneId: null,
       selectedId: null,
       saveState: 'idle',
-      savedModifiedDate: nowIso,
+      // A new project is not a saved project until the first write actually
+      // succeeds. This also lets autosave retry if that first write fails.
+      savedModifiedDate: null,
       lastSavedAt: null,
     });
-    // Persist the brand-new project immediately. Autosave now treats a freshly
-    // loaded/created project as already-saved (to avoid redundant saves when
-    // merely opening one), so a new project must write itself to disk here.
-    void get().saveProject();
+    // Persist immediately, while still allowing the store to expose failure via
+    // saveState. This fire-and-forget caller deliberately consumes rejection;
+    // awaited callers receive it from saveProject below.
+    void get().saveProject().catch(() => {});
   },
   addScene: (sceneData) => { const { project, historyPast } = get(); if (!project) return; const newScene: Scene = { ...sceneData, id: uuidv4(), hotspots: [], markers: [] }; const newScenes = [...project.scenes, newScene]; set({ historyPast: [...historyPast, project].slice(-100), historyFuture: [], project: { ...project, scenes: newScenes, modifiedDate: new Date().toISOString() }, currentSceneId: project.scenes.length === 0 ? newScene.id : get().currentSceneId }); },
   duplicateScene: (id) => { const { project, historyPast } = get(); if (!project) return; const index = project.scenes.findIndex((s) => s.id === id); if (index < 0) return; const raw = cloneScene(project.scenes[index]); const copy = { ...raw, hotspots: raw.hotspots.map((h) => ({ ...h, linkedHotspotId: undefined })) }; const scenes = [...project.scenes]; scenes.splice(index + 1, 0, copy); const nextProject = enforceHotspotIntegrity({ ...project, scenes, modifiedDate: new Date().toISOString() }); set({ historyPast: [...historyPast, project].slice(-100), historyFuture: [], project: nextProject, currentSceneId: copy.id, selectedId: null }); },
@@ -919,6 +1114,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   deleteObject: (sceneId, objectId) => {
     const { project, historyPast } = get();
     if (!project) return;
+    const sourceScene = project.scenes.find((scene) => scene.id === sceneId);
+    const objectExists = sourceScene?.hotspots.some((hotspot) => hotspot.id === objectId)
+      || sourceScene?.markers.some((marker) => marker.id === objectId);
+    if (!objectExists) return;
     const nextScenes = project.scenes.map((scene) => {
       if (scene.id === sceneId) {
         return {
@@ -949,6 +1148,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const { project, historyPast } = get();
     if (!project) return;
     const sourceScene = project.scenes.find((s) => s.id === sceneId);
+    const objectExists = sourceScene?.hotspots.some((hotspot) => hotspot.id === objectId)
+      || sourceScene?.markers.some((marker) => marker.id === objectId);
+    if (!objectExists) return;
     const sourceHotspot = sourceScene?.hotspots.find((h) => h.id === objectId) as any;
     const linkedId: string | undefined = sourceHotspot?.linkedHotspotId;
     const nextScenes = project.scenes.map((scene) => {
@@ -988,26 +1190,140 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
   canUndo: () => get().historyPast.length > 0,
   canRedo: () => get().historyFuture.length > 0,
+  clearHistory: () => set({ historyPast: [], historyFuture: [] }),
   saveProject: async () => {
     const { project } = get();
     if (!project) return;
-    const desktop = getDesktopApi();
-    set({ saveState: 'saving' });
-    try {
-      const normalizedForSave = enforceHotspotIntegrity(project);
-      const saved = desktop ? await desktop.saveProject(normalizedForSave) : await saveProjectFallback(normalizedForSave);
-      const savedAt = new Date().toISOString();
-      set((state) => ({
-        project: state.project?.id === saved.id
-          ? { ...state.project, modifiedDate: saved.modifiedDate }
-          : state.project,
-        saveState: 'saved',
-        savedModifiedDate: saved.modifiedDate,
-        lastSavedAt: savedAt,
-      }));
-    } catch {
-      set({ saveState: 'error' });
+    if (deletingProjectIds.has(project.id)) {
+      throw new Error('Cannot save a project while it is being deleted.');
+    }
+
+    const session = activeProjectSession;
+    const existing = pendingSnapshotSaves.get(project);
+    if (existing?.session === session) return existing.promise;
+
+    const requestId = ++saveRequestSequence;
+    latestSaveRequestByProject.set(project.id, { requestId, session });
+    if (get().project === project && activeProjectSession === session) {
+      set({ saveState: 'saving' });
+    }
+
+    const runSave = async () => {
+      const desktop = getDesktopApi();
+      try {
+        if (deletingProjectIds.has(project.id)) {
+          throw new Error('Cannot save a project while it is being deleted.');
+        }
+        const normalizedForSave = enforceHotspotIntegrity(project);
+        const saved = desktop
+          ? await desktop.saveProject(normalizedForSave)
+          : await saveProjectFallback(normalizedForSave);
+        const savedAt = new Date().toISOString();
+        const latest = latestSaveRequestByProject.get(project.id);
+
+        // A save from an editor/project session that is no longer active must
+        // never change the newly opened project's status or dirty baseline.
+        if (
+          activeProjectSession === session
+          && get().project?.id === project.id
+          && latest?.requestId === requestId
+          && latest.session === session
+        ) {
+          set((state) => {
+            // Preserve edits made while the snapshot was being written. A
+            // stale snapshot did reach disk, but it is not the current saved
+            // baseline and must not make newer edits look saved.
+            if (state.project !== project) {
+              const currentPath = String(state.project?.path || '').replace(/\\/g, '/').toLowerCase();
+              const snapshotPath = String(project.path || '').replace(/\\/g, '/').toLowerCase();
+              const canAdoptSavedPath = !!saved.path && (!currentPath || currentPath === snapshotPath);
+              return {
+                project: canAdoptSavedPath
+                  ? { ...state.project, path: saved.path }
+                  : state.project,
+                saveState: 'idle',
+              };
+            }
+            // The saved snapshot is the live project: record it as the clean baseline.
+            savedContentBaseline = { session, projectId: project.id, fingerprint: persistedProjectFingerprint(project) };
+            return {
+              project: { ...state.project, path: saved.path || state.project.path, modifiedDate: saved.modifiedDate },
+              saveState: 'saved',
+              savedModifiedDate: saved.modifiedDate,
+              lastSavedAt: savedAt,
+            };
+          });
+        }
+      } catch (error) {
+        const latest = latestSaveRequestByProject.get(project.id);
+        if (
+          activeProjectSession === session
+          && get().project?.id === project.id
+          && latest?.requestId === requestId
+          && latest.session === session
+        ) {
+          set({ saveState: deletingProjectIds.has(project.id) ? 'idle' : 'error' });
+        }
+        throw error instanceof Error ? error : new Error(String(error || 'Failed to save project'));
+      }
+    };
+
+    // Chain from both success and failure so one failed disk write cannot
+    // poison the queue. Calls still receive their own rejection.
+    const savePromise = saveQueue.then(runSave, runSave);
+    saveQueue = savePromise.catch(() => {});
+    pendingSnapshotSaves.set(project, { session, promise: savePromise });
+    const clearPending = () => {
+      const pending = pendingSnapshotSaves.get(project);
+      if (pending?.session === session && pending.promise === savePromise) {
+        pendingSnapshotSaves.delete(project);
+      }
+    };
+    void savePromise.then(clearPending, clearPending);
+    return savePromise;
+  },
+  flushProject: async () => {
+    const firstProject = get().project;
+    if (!firstProject) return;
+    const session = activeProjectSession;
+    const projectId = firstProject.id;
+
+    // A save only owns the immutable snapshot it started with. Keep taking a
+    // fresh snapshot after every completed write until no editor mutation
+    // landed while that write was in flight.
+    while (true) {
+      await waitForProjectOperations(projectId, session);
+      const snapshot = get().project;
+      if (
+        !snapshot
+        || snapshot.id !== projectId
+        || activeProjectSession !== session
+      ) {
+        throw new Error('The active project changed while its save was being flushed.');
+      }
+      // Nothing changed since the last successful save: do not rewrite the
+      // manifest (bumps modifiedDate, and a failing disk would block closing).
+      const fingerprint = persistedProjectFingerprint(snapshot);
+      if (
+        savedContentBaseline
+        && savedContentBaseline.session === session
+        && savedContentBaseline.projectId === projectId
+        && savedContentBaseline.fingerprint === fingerprint
+      ) return;
+      await get().saveProject();
+      // Imports/uploads can begin while the disk write is in flight. Wait for
+      // their final store updates before deciding that the snapshot was stable.
+      await waitForProjectOperations(projectId, session);
+
+      const liveProject = get().project;
+      if (
+        !liveProject
+        || liveProject.id !== projectId
+        || activeProjectSession !== session
+      ) {
+        throw new Error('The active project changed while its save was being flushed.');
+      }
+      if (persistedProjectFingerprint(liveProject) === fingerprint) return;
     }
   },
 }));
-

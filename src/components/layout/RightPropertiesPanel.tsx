@@ -209,7 +209,7 @@ const ResolutionRow = ({ sceneImage, project }: { sceneImage: string; project: a
 };
 
 const RightPropertiesPanel = () => {
-  const { project, currentSceneId, selectedId, updateScene, updateHotspot, updateMarker, updateProject, deleteObject, setSelectedId, setCurrentScene } = useProjectStore();
+  const { project, currentSceneId, selectedId, updateScene, updateHotspot, updateMarker, updateProject, setSelectedId, setCurrentScene } = useProjectStore();
   const { openConfirm, pushToast } = useUiStore();
   const [scenePickerOpen, setScenePickerOpen] = React.useState(false);
   const [iconPickerOpen, setIconPickerOpen] = React.useState(false);
@@ -226,7 +226,7 @@ const RightPropertiesPanel = () => {
     if (!sourceScene) return null;
     return sourceScene.hotspots.find((h) => h.id === targetViewCapture.hotspotId) || null;
   }, [project, targetViewCapture]);
-  const requestViewerPosition = React.useCallback(() => new Promise<{ yaw: number; pitch: number } | null>((resolve) => {
+  const requestViewerPosition = React.useCallback((expectedSceneId: string) => new Promise<{ yaw: number; pitch: number } | null>((resolve) => {
     const requestId = `viewer-position-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     let done = false;
     const finish = (value: { yaw: number; pitch: number } | null) => {
@@ -237,8 +237,12 @@ const RightPropertiesPanel = () => {
       resolve(value);
     };
     const onResponse = (event: Event) => {
-      const detail = (event as CustomEvent<{ requestId?: string; position?: { yaw?: number; pitch?: number } | null }>).detail;
+      const detail = (event as CustomEvent<{ requestId?: string; sceneId?: string | null; position?: { yaw?: number; pitch?: number } | null }>).detail;
       if (!detail || detail.requestId !== requestId) return;
+      if (detail.sceneId !== expectedSceneId) {
+        finish(null);
+        return;
+      }
       const yaw = Number(detail.position?.yaw);
       const pitch = Number(detail.position?.pitch);
       if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) {
@@ -249,8 +253,13 @@ const RightPropertiesPanel = () => {
     };
     const timeoutId = window.setTimeout(() => finish(null), 700);
     window.addEventListener('viewer-position-response', onResponse as EventListener);
-    window.dispatchEvent(new CustomEvent('viewer-position-request', { detail: { requestId } }));
+    window.dispatchEvent(new CustomEvent('viewer-position-request', { detail: { requestId, expectedSceneId } }));
   }), []);
+  const requestViewerObjectDelete = React.useCallback((sceneId: string, objectId: string) => {
+    window.dispatchEvent(new CustomEvent('viewer-delete-object-request', {
+      detail: { sceneId, objectId, confirmSingle: true },
+    }));
+  }, []);
   const [activeTab, setActiveTab] = React.useState<'scene' | 'hotspot' | 'marker'>('scene');
 
   React.useEffect(() => {
@@ -275,32 +284,26 @@ const RightPropertiesPanel = () => {
     else setActiveTab('scene');
   }, [scene, selectedId, hotspot?.id, marker?.id, setSelectedId, targetViewCapture]);
   React.useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      const active = document.activeElement as HTMLElement | null;
-      const tag = (active?.tagName || '').toUpperCase();
-      const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;
-      if (typing) return;
-      if (e.key === 'Delete' && selectedId && scene && activeTab !== 'scene') {
-        e.preventDefault();
-        openConfirm({
-          title: 'Delete Selected Object',
-          message: 'Delete this selected hotspot/marker?',
-          confirmLabel: 'Delete',
-          cancelLabel: 'Cancel',
-          tone: 'danger',
-          onConfirm: () => deleteObject(scene.id, selectedId),
-        });
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [activeTab, deleteObject, openConfirm, scene, selectedId]);
+    setScenePickerOpen(false);
+    setIconPickerOpen(false);
+    setPendingIcon(null);
+  }, [currentSceneId]);
   const beginTargetViewCapture = React.useCallback((sourceSceneId: string, hotspotId: string, targetSceneId: string) => {
     setTargetViewCapture({ sourceSceneId, hotspotId, targetSceneId });
     setCurrentScene(targetSceneId);
     setActiveTab('scene');
     pushToast('info', 'Rotate the target scene, then click Set Target View.');
   }, [pushToast, setCurrentScene]);
+  const finishTargetViewCapture = React.useCallback((capture: NonNullable<typeof targetViewCapture>) => {
+    const latest = useProjectStore.getState();
+    const sourceScene = latest.project?.scenes.find((item) => item.id === capture.sourceSceneId);
+    const sourceHotspot = sourceScene?.hotspots.find((item) => item.id === capture.hotspotId);
+    setTargetViewCapture(null);
+    if (!sourceScene || !sourceHotspot) return;
+    latest.setCurrentScene(sourceScene.id);
+    latest.setSelectedId(sourceHotspot.id);
+    setActiveTab('hotspot');
+  }, []);
   const setCapturedTargetView = React.useCallback(async () => {
     if (!targetViewCapture) {
       pushToast('error', 'Select a hotspot first.');
@@ -310,20 +313,29 @@ const RightPropertiesPanel = () => {
       pushToast('info', 'Open the hotspot target scene before setting target view.');
       return;
     }
-    const position = await requestViewerPosition();
+    const capture = targetViewCapture;
+    const position = await requestViewerPosition(capture.targetSceneId);
     if (!position) {
-      pushToast('error', 'Unable to read viewer position.');
+      pushToast('info', 'Wait for the target panorama to finish loading, then try again.');
       return;
     }
-    updateHotspot(targetViewCapture.sourceSceneId, targetViewCapture.hotspotId, {
+    const latest = useProjectStore.getState();
+    const latestSource = latest.project?.scenes.find((item) => item.id === capture.sourceSceneId);
+    const latestHotspot = latestSource?.hotspots.find((item) => item.id === capture.hotspotId);
+    if (latest.currentSceneId !== capture.targetSceneId || latestHotspot?.targetSceneId !== capture.targetSceneId) {
+      pushToast('info', 'The target scene changed before the view could be saved.');
+      return;
+    }
+    latest.updateHotspot(capture.sourceSceneId, capture.hotspotId, {
       targetYaw: position.yaw,
       targetPitch: position.pitch,
       entryYaw: position.yaw,
       entryPitch: position.pitch,
       customTargetView: true,
     });
+    finishTargetViewCapture(capture);
     pushToast('success', 'Target view saved for hotspot.');
-  }, [currentSceneId, pushToast, requestViewerPosition, targetViewCapture, updateHotspot]);
+  }, [currentSceneId, finishTargetViewCapture, pushToast, requestViewerPosition, targetViewCapture]);
   const rotateCaptureTargetYaw = React.useCallback((delta: number) => {
     if (!targetViewCapture || !captureHotspot) {
       pushToast('error', 'No hotspot is armed for target-view capture.');
@@ -388,16 +400,7 @@ const RightPropertiesPanel = () => {
         </h2>
         {selectedId && (
           <button
-            onClick={() =>
-              openConfirm({
-                title: 'Delete Selected Object',
-                message: 'Delete this selected hotspot/marker?',
-                confirmLabel: 'Delete',
-                cancelLabel: 'Cancel',
-                tone: 'danger',
-                onConfirm: () => deleteObject(scene.id, selectedId),
-              })
-            }
+            onClick={() => requestViewerObjectDelete(scene.id, selectedId)}
             className="p-1.5 text-red-400 hover:bg-red-50 rounded-lg transition-colors"
             title="Delete Selected"
           >
@@ -509,10 +512,12 @@ const RightPropertiesPanel = () => {
               </div>
               <button
                 type="button"
-                onClick={() => setTargetViewCapture(null)}
+                onClick={() => {
+                  if (targetViewCapture) finishTargetViewCapture(targetViewCapture);
+                }}
                 className="mt-2 w-full text-[11px] rounded-md border border-amber-300 bg-white px-2 py-1.5 text-amber-800 hover:bg-amber-100"
               >
-                Clear Capture
+                Cancel Capture
               </button>
             </div>
           )}
@@ -646,7 +651,7 @@ const RightPropertiesPanel = () => {
                   onChange={(e) => {
                     const value = String(e.target.value || 'marzipano');
                     updateHotspot(scene.id, hotspot.id, {
-                      navigationMode: value === 'marzipano' ? 'marzipano' : value === 'pannellum' ? 'pannellum' : 'marzipano',
+                      navigationMode: value === 'original' ? 'original' : value === 'pannellum' ? 'pannellum' : 'marzipano',
                     });
                   }}
                 >
@@ -835,16 +840,7 @@ const RightPropertiesPanel = () => {
                 Apply Style to All Hotspots
               </button>
               <button
-                onClick={() =>
-                  openConfirm({
-                    title: 'Delete Hotspot',
-                    message: `Delete hotspot "${hotspot.label || 'Untitled hotspot'}"?`,
-                    confirmLabel: 'Delete',
-                    cancelLabel: 'Cancel',
-                    tone: 'danger',
-                    onConfirm: () => deleteObject(scene.id, hotspot.id),
-                  })
-                }
+                onClick={() => requestViewerObjectDelete(scene.id, hotspot.id)}
                 className="w-full px-3 py-2 rounded-lg bg-red-50 text-red-600 border border-red-100 text-xs font-semibold"
               >
                 Delete
@@ -1057,4 +1053,3 @@ const RightPropertiesPanel = () => {
 };
 
 export default RightPropertiesPanel;
-

@@ -1,9 +1,10 @@
 import React from 'react';
 import { X, Download, ShieldCheck, PlayCircle, FolderOpen, Loader2, RefreshCw, Monitor } from 'lucide-react';
-import { useProjectStore, checkProjectHealth, exportProjectWebsite, previewExport, openPathInFileManager, getInlinePreviewUrl } from '../../store/projectStore';
+import { useProjectStore, checkProjectHealth, exportProjectWebsite, previewExport, openPathInFileManager, getInlinePreviewUrl, releaseInlinePreview } from '../../store/projectStore';
 import { ExportOptions } from '../../lib/desktop';
 import { useUiStore } from '../../store/uiStore';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
+import type { Project } from '../../types';
 
 function buildExportOptionsFromProject(project: any): ExportOptions {
   return {
@@ -24,7 +25,7 @@ function toErrorMessage(error: unknown, fallback: string) {
 }
 
 const ExportWebsiteModal = ({ onClose }: { onClose: () => void }) => {
-  const { project, updateProject } = useProjectStore();
+  const { project, updateProject, flushProject } = useProjectStore();
   const { pushToast } = useUiStore();
   const [isBusy, setIsBusy] = React.useState(false);
   const [healthText, setHealthText] = React.useState('');
@@ -33,36 +34,71 @@ const ExportWebsiteModal = ({ onClose }: { onClose: () => void }) => {
   const [previewLoading, setPreviewLoading] = React.useState(false);
   const [previewError, setPreviewError] = React.useState('');
   const mountedRef = React.useRef(true);
+  const busyRef = React.useRef(false);
   const sceneCount = project?.scenes?.length || 0;
   const hasScenes = sceneCount > 0;
   const hasFloorPlan = !!project?.floorPlanImage;
 
   React.useEffect(() => {
+    // StrictMode replays mount effects in development. Without re-arming this
+    // ref, every completed health/export/preview request is mistaken for work
+    // belonging to an unmounted modal and its loading state never clears.
+    mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
-  const tryClose = React.useCallback(() => {
-    if (isBusy) return;
-    onClose();
-  }, [isBusy, onClose]);
+  React.useEffect(() => () => {
+    void releaseInlinePreview();
+  }, []);
 
-  useEscapeClose(!isBusy, tryClose);
+  const tryClose = React.useCallback(() => {
+    if (busyRef.current) return;
+    onClose();
+  }, [onClose]);
+
+  // Keep the modal in the global keyboard-layer stack while busy; tryClose
+  // already refuses dismissal, and editor shortcuts must remain blocked.
+  useEscapeClose(true, tryClose);
   const [options, setOptions] = React.useState<ExportOptions>(buildExportOptionsFromProject(project));
 
   const setOpt = <K extends keyof ExportOptions>(key: K, value: ExportOptions[K]) =>
     setOptions((prev) => ({ ...prev, [key]: value }));
-  const ensureHasScenes = (actionName: string) => {
-    if (hasScenes) return true;
+  const ensureHasScenes = (candidate: Project, actionName: string) => {
+    if (candidate.scenes.length > 0) return true;
     pushToast('info', `Add at least one scene before ${actionName}.`);
     return false;
   };
 
-  const runHealth = async () => {
-    if (!project) return;
+  const beginBusy = () => {
+    if (busyRef.current) return false;
+    busyRef.current = true;
     setIsBusy(true);
+    return true;
+  };
+
+  const endBusy = () => {
+    busyRef.current = false;
+    if (mountedRef.current) setIsBusy(false);
+  };
+
+  const getFlushedProject = async () => {
+    const projectId = project?.id;
+    if (!projectId) return null;
+    await flushProject();
+    const latestProject = useProjectStore.getState().project;
+    if (!latestProject || latestProject.id !== projectId) {
+      throw new Error('The active project changed while preparing the export.');
+    }
+    return latestProject;
+  };
+
+  const runHealth = async () => {
+    if (!project || !beginBusy()) return;
     try {
-      const normalizedOptions: ExportOptions = { ...options, includeFloorPlan: hasFloorPlan ? options.includeFloorPlan : false };
-      const result = await checkProjectHealth(project, normalizedOptions);
+      const latestProject = await getFlushedProject();
+      if (!latestProject) return;
+      const normalizedOptions: ExportOptions = { ...options, includeFloorPlan: !!latestProject.floorPlanImage && options.includeFloorPlan };
+      const result = await checkProjectHealth(latestProject, normalizedOptions);
       if (mountedRef.current) {
         setHealthText([result.ok ? 'Health check passed.' : 'Health check failed.', ...result.issues.map((x) => `Issue: ${x}`), ...result.warnings.map((x) => `Warning: ${x}`)].join('\n'));
       }
@@ -71,18 +107,21 @@ const ExportWebsiteModal = ({ onClose }: { onClose: () => void }) => {
       if (mountedRef.current) setHealthText(`Health check failed.\nIssue: ${message}`);
       pushToast('error', message);
     } finally {
-      if (mountedRef.current) setIsBusy(false);
+      endBusy();
     }
   };
 
   const runExport = async () => {
     if (!project) return;
-    if (!ensureHasScenes('exporting')) return;
-    setIsBusy(true);
+    if (!ensureHasScenes(project, 'exporting') || !beginBusy()) return;
     try {
-      const normalizedOptions: ExportOptions = { ...options, includeFloorPlan: hasFloorPlan ? options.includeFloorPlan : false, zipOutput: true };
-      updateProject({ exportSettings: { ...project.exportSettings, includeBranding: normalizedOptions.includeBranding, showFloorPlan: normalizedOptions.includeFloorPlan, showGallery: normalizedOptions.includeGallery, exportTemplate: normalizedOptions.template, imageOptimization: normalizedOptions.imageOptimization, showLoadingScreen: normalizedOptions.showLoadingScreen } });
-      const result = await exportProjectWebsite(project, normalizedOptions);
+      let latestProject = await getFlushedProject();
+      if (!latestProject || !ensureHasScenes(latestProject, 'exporting')) return;
+      const normalizedOptions: ExportOptions = { ...options, includeFloorPlan: !!latestProject.floorPlanImage && options.includeFloorPlan, zipOutput: true };
+      updateProject({ exportSettings: { ...latestProject.exportSettings, includeBranding: normalizedOptions.includeBranding, showFloorPlan: normalizedOptions.includeFloorPlan, showGallery: normalizedOptions.includeGallery, exportTemplate: normalizedOptions.template, imageOptimization: normalizedOptions.imageOptimization, showLoadingScreen: normalizedOptions.showLoadingScreen } });
+      latestProject = await getFlushedProject();
+      if (!latestProject) return;
+      const result = await exportProjectWebsite(latestProject, normalizedOptions);
       if (result?.canceled) return;
       if (result?.zipPath && mountedRef.current) {
         setLastExportDir(result.zipPath);
@@ -92,31 +131,34 @@ const ExportWebsiteModal = ({ onClose }: { onClose: () => void }) => {
     } catch (error) {
       pushToast('error', toErrorMessage(error, 'Export failed'));
     } finally {
-      if (mountedRef.current) setIsBusy(false);
+      endBusy();
     }
   };
 
   const runExternalPreview = async () => {
     if (!project) return;
-    if (!ensureHasScenes('previewing export')) return;
-    setIsBusy(true);
+    if (!ensureHasScenes(project, 'previewing export') || !beginBusy()) return;
     try {
-      await previewExport(project, { ...options, includeFloorPlan: hasFloorPlan ? options.includeFloorPlan : false });
+      const latestProject = await getFlushedProject();
+      if (!latestProject || !ensureHasScenes(latestProject, 'previewing export')) return;
+      await previewExport(latestProject, { ...options, includeFloorPlan: !!latestProject.floorPlanImage && options.includeFloorPlan });
     } catch (error) {
       pushToast('error', toErrorMessage(error, 'Preview export failed'));
     } finally {
-      if (mountedRef.current) setIsBusy(false);
+      endBusy();
     }
   };
 
   const loadInlinePreview = async () => {
     if (!project) return;
-    if (!ensureHasScenes('previewing export')) return;
+    if (!ensureHasScenes(project, 'previewing export') || !beginBusy()) return;
     setPreviewLoading(true);
     setPreviewError('');
     setPreviewUrl(null);
     try {
-      const url = await getInlinePreviewUrl(project, { ...options, includeFloorPlan: hasFloorPlan ? options.includeFloorPlan : false });
+      const latestProject = await getFlushedProject();
+      if (!latestProject || !ensureHasScenes(latestProject, 'previewing export')) return;
+      const url = await getInlinePreviewUrl(latestProject, { ...options, includeFloorPlan: !!latestProject.floorPlanImage && options.includeFloorPlan });
       if (mountedRef.current) {
         if (url) setPreviewUrl(url);
         else setPreviewError('Preview server did not return a URL.');
@@ -125,6 +167,7 @@ const ExportWebsiteModal = ({ onClose }: { onClose: () => void }) => {
       if (mountedRef.current) setPreviewError(toErrorMessage(error, 'Preview failed'));
     } finally {
       if (mountedRef.current) setPreviewLoading(false);
+      endBusy();
     }
   };
 

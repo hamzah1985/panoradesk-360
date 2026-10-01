@@ -12,8 +12,10 @@ import '@photo-sphere-viewer/markers-plugin/index.css';
 import { resolveAssetSrc } from '../../lib/media';
 import { SHARED_VIEWER_INERTIA, SHARED_VIEWER_MOTION, SHARED_VIEWER_TRANSITION } from '../../lib/viewerMotion';
 import { attachViewerInertia } from '../../lib/viewerInertia';
+import { createPanoramaPreloader, PANORAMA_LOAD_TIMEOUT_MS } from '../../lib/panoramaLoad';
 import { v4 as uuidv4 } from 'uuid';
 import { useUiStore } from '../../store/uiStore';
+import { hasEscapeCloseLayer } from '../../hooks/useEscapeClose';
 import { hotspotHtmlIconGlyph, normalizeHotspotIconId } from '../../lib/hotspotIcons';
 
 function hotspotHtml(
@@ -213,6 +215,34 @@ function escapeHtml(value: string | number | undefined | null) {
 
 function isSamePanoramaOrInflight(currentLoadKey: string, panoramaKey: string) {
   return currentLoadKey === panoramaKey || currentLoadKey === `loading:${panoramaKey}`;
+}
+
+
+function withPanoramaLoadTimeout<T>(promise: Promise<T>, onTimeout: () => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onTimeout();
+      reject(new Error('Panorama load timed out'));
+    }, PANORAMA_LOAD_TIMEOUT_MS);
+
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function clampPitch(value: number) {
@@ -476,20 +506,64 @@ const PanoramaViewer = () => {
   const stopInertiaRef = React.useRef<(() => void) | null>(null);
   const setEnabledInertiaRef = React.useRef<((v: boolean) => void) | null>(null);
   const loadedPanoramaKeyRef = React.useRef('');
-  const draggingHotspotRef = React.useRef<{ hotspotId: string; startX: number; startY: number; currentYaw: number; currentPitch: number; moved: boolean } | null>(null);
+  const lastSuccessfulPanoramaRef = React.useRef<{ sceneId: string; key: string } | null>(null);
+  const initialPanoramaPendingKeyRef = React.useRef<string | null>(null);
+  const initialPanoramaTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panoramaLoadRequestRef = React.useRef(0);
+  const draggingHotspotRef = React.useRef<{
+    sceneId: string;
+    hotspotId: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    currentYaw: number;
+    currentPitch: number;
+    moved: boolean;
+  } | null>(null);
   const onDragStartHotspotRef = React.useRef<((evt: PointerEvent) => void) | null>(null);
   const lastHotspotClickRef = React.useRef<{ hotspotId: string; time: number } | null>(null);
-  const { project, currentSceneId, selectedId, setSelectedId, setCurrentScene, saveProject, setMode, currentMode, addHotspot, updateHotspot, deleteObject, deleteObjectAndLinked } = useProjectStore();
+  const { project, currentSceneId, selectedId, setSelectedId, setCurrentScene, saveProject, currentMode, addHotspot, updateHotspot } = useProjectStore();
   const { activeTool, setActiveTool } = useEditorStore();
   const { pushToast, openConfirm } = useUiStore();
-
-  const handleHotspotDelete = React.useCallback((sceneId: string, hotspotId: string) => {
+  const isPanoramaInteractionBlocked = React.useCallback(() => {
+    const loadKey = String(loadedPanoramaKeyRef.current || '');
     const state = useProjectStore.getState();
+    const activeScene = state.project?.scenes.find((scene) => scene.id === state.currentSceneId);
+    if (!activeScene) return true;
+    const activeKey = `${activeScene.id}|${activeScene.image}`;
+    return loadKey !== activeKey;
+  }, []);
+
+  const handleHotspotDelete = React.useCallback((sceneId: string, hotspotId: string, confirmSingle = false) => {
+    const state = useProjectStore.getState();
+    if (state.currentSceneId !== sceneId) return;
     const scene = state.project?.scenes.find((s) => s.id === sceneId);
     const hotspot = scene?.hotspots.find((h) => h.id === hotspotId) as any;
+    const marker = scene?.markers.find((m) => m.id === hotspotId);
+    if (!hotspot && !marker) return;
     const linkedId: string | undefined = hotspot?.linkedHotspotId;
     if (!linkedId) {
-      state.deleteObject(sceneId, hotspotId);
+      const deleteSingle = () => {
+        const latest = useProjectStore.getState();
+        const latestScene = latest.project?.scenes.find((item) => item.id === sceneId);
+        const stillExists = latestScene?.hotspots.some((item) => item.id === hotspotId)
+          || latestScene?.markers.some((item) => item.id === hotspotId);
+        if (latest.currentSceneId === sceneId && stillExists) {
+          latest.deleteObject(sceneId, hotspotId);
+        }
+      };
+      if (!confirmSingle) {
+        deleteSingle();
+        return;
+      }
+      openConfirm({
+        title: marker ? 'Delete Marker' : 'Delete Hotspot',
+        message: `Delete this ${marker ? 'marker' : 'hotspot'}?`,
+        confirmLabel: 'Delete',
+        cancelLabel: 'Cancel',
+        tone: 'danger',
+        onConfirm: deleteSingle,
+      });
       return;
     }
     openConfirm({
@@ -500,8 +574,18 @@ const PanoramaViewer = () => {
       cancelLabel: 'Cancel',
       tone: 'danger',
       altTone: 'danger',
-      onConfirm: () => { state.deleteObjectAndLinked(sceneId, hotspotId); },
-      onAlt: () => { state.deleteObject(sceneId, hotspotId); },
+      onConfirm: () => {
+        const latest = useProjectStore.getState();
+        if (latest.currentSceneId === sceneId) {
+          latest.deleteObjectAndLinked(sceneId, hotspotId);
+        }
+      },
+      onAlt: () => {
+        const latest = useProjectStore.getState();
+        if (latest.currentSceneId === sceneId) {
+          latest.deleteObject(sceneId, hotspotId);
+        }
+      },
     });
   }, [openConfirm]);
 
@@ -509,6 +593,7 @@ const PanoramaViewer = () => {
   const [modalType, setModalType] = React.useState<'hotspot' | 'marker' | null>(null);
   const [isDragOverViewer, setIsDragOverViewer] = React.useState(false);
   const [isSceneLoading, setIsSceneLoading] = React.useState(false);
+  const [failedSceneId, setFailedSceneId] = React.useState<string | null>(null);
   const [targetViewPlacement, setTargetViewPlacement] = React.useState<{
     sourceSceneId: string;
     hotspotId: string;
@@ -521,10 +606,10 @@ const [viewerTick, setViewerTick] = React.useState(0);
   const previewEntryFromSceneRef = React.useRef<string | null>(null);
   const previewEntryFromHotspotRef = React.useRef<string | null>(null);
   const previewEntryOrientationRef = React.useRef<{ yaw: number; pitch: number } | null>(null);
+  const previewEntryTargetSceneRef = React.useRef<string | null>(null);
   const previewCarryZoomRef = React.useRef<number | null>(null);
   const pendingTransitionRef = React.useRef<{ type: 'fade'; duration: number } | null>(null);
-  const preloadCacheRef = React.useRef<Set<string>>(new Set());
-  const preloadInflightRef = React.useRef<Set<string>>(new Set());
+  const preloaderRef = React.useRef(createPanoramaPreloader());
   const preserveEditorZoomOnceRef = React.useRef(false);
 
   const currentScene = project?.scenes.find((s) => s.id === currentSceneId);
@@ -598,19 +683,13 @@ const [viewerTick, setViewerTick] = React.useState(0);
     }
   }, [isPreview, viewerTick]);
 
-  const preloadPanorama = React.useCallback(async (sceneId: string) => {
+  const preloadPanorama = React.useCallback(async (sceneId: string, priority = false) => {
     if (!project) return;
     const target = project.scenes.find((s) => s.id === sceneId);
     if (!target) return;
     const src = resolveAssetSrc(project, target.image);
-    if (!src || preloadCacheRef.current.has(src) || preloadInflightRef.current.has(src)) return;
-    preloadInflightRef.current.add(src);
-    await new Promise<void>((resolve) => {
-      const img = new Image();
-      img.onload = () => { preloadCacheRef.current.add(src); preloadInflightRef.current.delete(src); resolve(); };
-      img.onerror = () => { preloadInflightRef.current.delete(src); resolve(); };
-      img.src = src;
-    });
+    if (!src) return;
+    await preloaderRef.current.preload(src, { priority });
   }, [project]);
 
   const smoothPreviewNavigate = React.useCallback((targetSceneId: string, marker: any) => {
@@ -622,6 +701,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       previewTransitioningRef.current = true;
       setIsSceneLoading(true);
       pendingPreviewTargetRef.current = targetSceneId;
+      previewEntryTargetSceneRef.current = targetSceneId;
       previewEntryFromSceneRef.current = currentSceneId || null;
       previewEntryFromHotspotRef.current = String(marker?.config?.sourceHotspotId || marker?.id || '');
       const cfg = marker?.config || {};
@@ -629,7 +709,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       const transitionDuration = Math.max(150, Math.min(5000, Math.round(Number(cfg?.transitionDuration) || SHARED_VIEWER_TRANSITION.duration)));
       pendingTransitionRef.current = { type: 'fade', duration: transitionDuration };
       setPreviewControlsEnabled(false);
-      await preloadPanorama(targetSceneId);
+      await preloadPanorama(targetSceneId, true);
       previewCarryZoomRef.current = null;
       setCurrentScene(targetSceneId);
     })()
@@ -638,6 +718,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
         previewEntryFromSceneRef.current = null;
         previewEntryFromHotspotRef.current = null;
         previewEntryOrientationRef.current = null;
+        previewEntryTargetSceneRef.current = null;
         previewCarryZoomRef.current = null;
         pendingTransitionRef.current = null;
         previewTransitioningRef.current = false;
@@ -665,9 +746,17 @@ const [viewerTick, setViewerTick] = React.useState(0);
 
   React.useEffect(() => {
     const onViewerPositionRequest = (evt: Event) => {
-      const detail = (evt as CustomEvent<{ requestId?: string }>).detail;
+      const detail = (evt as CustomEvent<{ requestId?: string; expectedSceneId?: string }>).detail;
       if (!detail?.requestId) return;
-      const pos = viewerRef.current?.getPosition?.();
+      const state = useProjectStore.getState();
+      const activeScene = state.project?.scenes.find((scene) => scene.id === state.currentSceneId);
+      const activeKey = activeScene ? `${activeScene.id}|${activeScene.image}` : '';
+      const ownsLoadedScene = !!(
+        activeScene
+        && loadedPanoramaKeyRef.current === activeKey
+        && (!detail.expectedSceneId || detail.expectedSceneId === activeScene.id)
+      );
+      const pos = ownsLoadedScene ? viewerRef.current?.getPosition?.() : null;
       const yaw = Number(pos?.yaw);
       const pitch = Number(pos?.pitch);
       const payload = Number.isFinite(yaw) && Number.isFinite(pitch)
@@ -676,6 +765,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       window.dispatchEvent(new CustomEvent('viewer-position-response', {
         detail: {
           requestId: detail.requestId,
+          sceneId: ownsLoadedScene ? activeScene?.id : null,
           position: payload,
         },
       }));
@@ -685,6 +775,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
   }, []);
 
   const createNavigationHotspot = React.useCallback((targetSceneId: string, yaw: number, pitch: number, label?: string, options?: CreateNavigationOptions) => {
+    if (isPanoramaInteractionBlocked()) return false;
     if (!project || !currentSceneId || !targetSceneId) return false;
     if (targetSceneId === currentSceneId) return false;
     const targetScene = project.scenes.find((scene) => scene.id === targetSceneId);
@@ -720,23 +811,26 @@ const [viewerTick, setViewerTick] = React.useState(0);
       });
     }
     return true;
-  }, [project, currentSceneId, addHotspot]);
+  }, [project, currentSceneId, addHotspot, isPanoramaInteractionBlocked]);
 
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (useUiStore.getState().confirm.open) return;
+      if (hasEscapeCloseLayer()) return;
       const active = document.activeElement as HTMLElement | null;
       const targetTag = (active?.tagName || '').toUpperCase();
       const typing = targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT' || !!active?.isContentEditable;
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        saveProject();
+        void saveProject().catch(() => {});
       }
       if (!typing && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'p' && (project?.scenes?.length || 0) > 0) {
-        setMode(AppMode.PREVIEW);
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('request-preview'));
       }
       if (!typing && !isPreviewRef.current && currentSceneId && selectedId && (e.key === 'Delete' || e.key === 'Backspace')) {
         e.preventDefault();
-        handleHotspotDelete(currentSceneId, selectedId);
+        handleHotspotDelete(currentSceneId, selectedId, true);
       }
       if (!typing && e.altKey && e.key.toLowerCase() === 'v' && currentSceneId && !isPreviewRef.current) {
         e.preventDefault();
@@ -755,6 +849,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
     };
 
     const handleCaptureView = () => {
+      if (isPanoramaInteractionBlocked()) return;
       if (viewerRef.current && currentSceneId && !isPreviewRef.current) {
         const pos = viewerRef.current.getPosition();
         useProjectStore.getState().updateSceneOrientation(currentSceneId, pos.yaw, pos.pitch);
@@ -762,9 +857,12 @@ const [viewerTick, setViewerTick] = React.useState(0);
     };
 
     const handleResetView = () => {
+      if (isPanoramaInteractionBlocked()) return;
       const state = useProjectStore.getState();
       const scene = state.project?.scenes.find((s) => s.id === state.currentSceneId);
       if (!viewerRef.current || !scene) return;
+      stopInertiaRef.current?.();
+      try { (viewerRef.current as any)?.stopAll?.(); } catch {}
       void (viewerRef.current as any)?.animate?.({
         yaw: scene.initialYaw || 0,
         pitch: scene.initialPitch || 0,
@@ -776,21 +874,33 @@ const [viewerTick, setViewerTick] = React.useState(0);
       if (!viewerRef.current) return;
       viewerRef.current.toggleFullscreen();
     };
+    const handleDeleteObjectRequest = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        sceneId?: string;
+        objectId?: string;
+        confirmSingle?: boolean;
+      }>).detail;
+      if (!detail?.sceneId || !detail.objectId) return;
+      handleHotspotDelete(detail.sceneId, detail.objectId, detail.confirmSingle !== false);
+    };
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('capture-view', handleCaptureView);
     window.addEventListener('reset-view', handleResetView);
     window.addEventListener('toggle-viewer-fullscreen', handleToggleViewerFullscreen);
+    window.addEventListener('viewer-delete-object-request', handleDeleteObjectRequest as EventListener);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('capture-view', handleCaptureView);
       window.removeEventListener('reset-view', handleResetView);
       window.removeEventListener('toggle-viewer-fullscreen', handleToggleViewerFullscreen);
+      window.removeEventListener('viewer-delete-object-request', handleDeleteObjectRequest as EventListener);
     };
-  }, [saveProject, setMode, currentSceneId, selectedId, deleteObject, handleHotspotDelete, project?.scenes, setCurrentScene]);
+  }, [saveProject, currentSceneId, selectedId, handleHotspotDelete, project?.scenes, setCurrentScene, isPanoramaInteractionBlocked]);
 
   React.useEffect(() => {
     const onViewerDeleteClick = (evt: MouseEvent) => {
+      if (isPanoramaInteractionBlocked()) return;
       const target = evt.target as HTMLElement | null;
       if (!target) return;
       const btn = target.closest('[data-hotspot-delete]') as HTMLElement | null;
@@ -804,6 +914,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       handleHotspotDelete(sceneId, hotspotId);
     };
     const onPreviewHotspotClick = (evt: MouseEvent) => {
+      if (isPanoramaInteractionBlocked()) return;
       if (!isPreviewRef.current) return;
       const target = evt.target as HTMLElement | null;
       if (!target) return;
@@ -834,6 +945,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       });
     };
     const onEditorHotspotDoubleClick = (evt: MouseEvent) => {
+      if (isPanoramaInteractionBlocked()) return;
       if (isPreviewRef.current) return;
       const target = evt.target as HTMLElement | null;
       if (!target) return;
@@ -852,6 +964,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       const sourceHotspot = sourceScene?.hotspots.find((h) => h.id === hotspotId);
       const targetScene = project?.scenes.find((s) => s.id === targetSceneId);
       previewEntryOrientationRef.current = resolveHotspotEntry(sourceSceneId, targetSceneId, sourceHotspot as any);
+      previewEntryTargetSceneRef.current = targetSceneId;
       previewEntryFromSceneRef.current = sourceSceneId || null;
       previewEntryFromHotspotRef.current = hotspotId;
       pendingTransitionRef.current = {
@@ -896,7 +1009,9 @@ const [viewerTick, setViewerTick] = React.useState(0);
     if (!container) return;
 
     const onDragStartHotspot = (evt: PointerEvent) => {
+      if (isPanoramaInteractionBlocked()) return;
       if (isPreviewRef.current) return;
+      if (evt.button !== 0 || evt.isPrimary === false) return;
       if (evt.pointerType === 'touch') return;
       const target = evt.target as HTMLElement | null;
       if (!target) return;
@@ -939,6 +1054,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
           const sourceHotspot = sourceScene?.hotspots.find((h) => h.id === hotspotId);
           const targetScene = project?.scenes.find((s) => s.id === targetSceneId);
           previewEntryOrientationRef.current = resolveHotspotEntry(sourceSceneId, targetSceneId, sourceHotspot as any);
+          previewEntryTargetSceneRef.current = targetSceneId;
           previewEntryFromSceneRef.current = sourceSceneId || null;
           previewEntryFromHotspotRef.current = hotspotId;
           pendingTransitionRef.current = {
@@ -966,10 +1082,13 @@ const [viewerTick, setViewerTick] = React.useState(0);
       // Read actual hotspot position so drag initializes at true coords (not 0,0)
       const storeState = useProjectStore.getState();
       const storeScene = storeState.project?.scenes.find((s) => s.id === storeState.currentSceneId);
+      if (!storeScene || !storeState.currentSceneId) return;
       const storeHotspot = storeScene?.hotspots.find((h) => h.id === hotspotId)
         || storeScene?.markers.find((m) => m.id === hotspotId);
       draggingHotspotRef.current = {
+        sceneId: storeState.currentSceneId,
         hotspotId,
+        pointerId: evt.pointerId,
         startX: evt.clientX,
         startY: evt.clientY,
         currentYaw: storeHotspot?.yaw ?? 0,
@@ -985,6 +1104,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
     onDragStartHotspotRef.current = onDragStartHotspot;
 
     const onEditorHotspotClick = (evt: MouseEvent) => {
+      if (isPanoramaInteractionBlocked()) return;
       if (isPreviewRef.current) return;
       if (activeToolRef.current !== 'select') return;
       const target = evt.target as HTMLElement | null;
@@ -1008,10 +1128,13 @@ const [viewerTick, setViewerTick] = React.useState(0);
       container.removeEventListener('click', onViewerDeleteClick, true);
       container.removeEventListener('click', onEditorHotspotClick, true);
     };
-  }, [project, resolveTargetSceneEntry, smoothPreviewNavigate, setCurrentScene, setSelectedId, pushToast]);
+  }, [project, resolveTargetSceneEntry, smoothPreviewNavigate, setCurrentScene, setSelectedId, pushToast, isPanoramaInteractionBlocked]);
 
   const handleViewerDragOver = React.useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    if (isPreviewRef.current) return;
+    if (isPreviewRef.current || isPanoramaInteractionBlocked()) {
+      setIsDragOverViewer(false);
+      return;
+    }
     const hasScene = !!((window as any).__panoraDragSceneId
       || e.dataTransfer?.types.includes('application/x-panoradesk-scene-id')
       || e.dataTransfer?.types.includes('text/plain'));
@@ -1019,7 +1142,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
     setIsDragOverViewer(true);
-  }, []);
+  }, [isPanoramaInteractionBlocked]);
 
   const handleViewerDragLeave = React.useCallback(() => {
     setIsDragOverViewer(false);
@@ -1032,7 +1155,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
       (window as any).__panoraDragSceneId = null;
     };
 
-    if (!project || !currentSceneId || isPreviewRef.current || !viewerRef.current || !containerRef.current) {
+    if (!project || !currentSceneId || isPreviewRef.current || isPanoramaInteractionBlocked() || !viewerRef.current || !containerRef.current) {
       clearDragSceneId();
       return;
     }
@@ -1061,7 +1184,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
 
     createNavigationHotspot(targetSceneId, safeSpherical.yaw, safeSpherical.pitch, `Go to ${targetScene.name}`, { promptTargetViewPlacement: false });
     clearDragSceneId();
-  }, [project, currentSceneId, createNavigationHotspot]);
+  }, [project, currentSceneId, createNavigationHotspot, isPanoramaInteractionBlocked]);
 
   // Register the pointerdown drag-start listener ONCE at mount, before the viewer is created,
   // so it is always first in the capture-phase queue. Effect A updates onDragStartHotspotRef
@@ -1079,7 +1202,10 @@ const [viewerTick, setViewerTick] = React.useState(0);
     if (!containerRef.current || !project || !currentScene?.image) return;
     if (viewerRef.current) return;
     const initialKey = `${currentScene.id}|${currentScene.image}`;
-    loadedPanoramaKeyRef.current = initialKey;
+    loadedPanoramaKeyRef.current = `loading:${initialKey}`;
+    initialPanoramaPendingKeyRef.current = initialKey;
+    setFailedSceneId(null);
+    setIsSceneLoading(true);
 
     const viewer = new Viewer({
       container: containerRef.current,
@@ -1096,15 +1222,88 @@ const [viewerTick, setViewerTick] = React.useState(0);
 
     viewerRef.current = viewer;
     setViewerTick((n) => n + 1);
+    const clearInitialLoadTimeout = () => {
+      if (initialPanoramaTimeoutRef.current) {
+        clearTimeout(initialPanoramaTimeoutRef.current);
+        initialPanoramaTimeoutRef.current = null;
+      }
+    };
+    const ownsInitialPanoramaLoad = () => {
+      const state = useProjectStore.getState();
+      const activeScene = state.project?.scenes.find((scene) => scene.id === state.currentSceneId);
+      return (
+        viewerRef.current === viewer
+        && initialPanoramaPendingKeyRef.current === initialKey
+        && loadedPanoramaKeyRef.current === `loading:${initialKey}`
+        && activeScene?.id === currentScene.id
+        && `${activeScene.id}|${activeScene.image}` === initialKey
+      );
+    };
     viewer.addEventListener('panorama-loaded', () => {
+      const ownsInitialLoad = ownsInitialPanoramaLoad();
+      if (ownsInitialLoad) {
+        clearInitialLoadTimeout();
+        initialPanoramaPendingKeyRef.current = null;
+        loadedPanoramaKeyRef.current = initialKey;
+        lastSuccessfulPanoramaRef.current = { sceneId: currentScene.id, key: initialKey };
+        setPreviewControlsEnabled(true);
+        setIsSceneLoading(false);
+        setFailedSceneId(null);
+      } else if (initialPanoramaPendingKeyRef.current === initialKey) {
+        // The user selected another scene before the constructor panorama settled.
+        clearInitialLoadTimeout();
+        initialPanoramaPendingKeyRef.current = null;
+        if (loadedPanoramaKeyRef.current === `loading:${initialKey}`) {
+          loadedPanoramaKeyRef.current = '';
+          setPreviewControlsEnabled(true);
+          setIsSceneLoading(false);
+        }
+      }
       setViewerTick((n) => n + 1);
     });
     viewer.addEventListener('panorama-error', () => {
+      const ownsInitialLoad = ownsInitialPanoramaLoad();
+      if (!ownsInitialLoad) {
+        if (initialPanoramaPendingKeyRef.current === initialKey) {
+          clearInitialLoadTimeout();
+          initialPanoramaPendingKeyRef.current = null;
+          if (loadedPanoramaKeyRef.current === `loading:${initialKey}`) {
+            loadedPanoramaKeyRef.current = '';
+            setPreviewControlsEnabled(true);
+            setIsSceneLoading(false);
+          }
+        }
+        // Subsequent loads are owned by their guarded setPanorama promise.
+        return;
+      }
+      clearInitialLoadTimeout();
+      initialPanoramaPendingKeyRef.current = null;
+      loadedPanoramaKeyRef.current = '';
+      try { (viewer as any)?.loader?.hide?.(); } catch {}
+      try { viewer.hideError(); } catch {}
+      setPreviewControlsEnabled(true);
       setIsSceneLoading(false);
+      setFailedSceneId(currentScene.id);
       pushToast('error', 'Failed to load panorama. Check the image file is a valid 360° photo and the path is correct.');
     });
 
+    initialPanoramaTimeoutRef.current = setTimeout(() => {
+      initialPanoramaTimeoutRef.current = null;
+      const ownsInitialLoad = ownsInitialPanoramaLoad();
+      if (!ownsInitialLoad) return;
+      initialPanoramaPendingKeyRef.current = null;
+      try { (viewer as any)?.textureLoader?.abortLoading?.(); } catch {}
+      try { (viewer as any)?.loader?.hide?.(); } catch {}
+      try { viewer.hideError(); } catch {}
+      loadedPanoramaKeyRef.current = '';
+      setPreviewControlsEnabled(true);
+      setIsSceneLoading(false);
+      setFailedSceneId(currentScene.id);
+      pushToast('error', 'Panorama loading timed out. Check the image file or connection, then try again.');
+    }, PANORAMA_LOAD_TIMEOUT_MS);
+
     viewer.addEventListener('click', ({ data }) => {
+      if (isPanoramaInteractionBlocked()) return;
       if (isPreviewRef.current) return;
       const normalized = normalizeDropSphericalPosition(data) || normalizeDropSphericalPosition((viewer as any)?.getPosition?.());
       if (!normalized) return;
@@ -1127,6 +1326,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
 
     const markersPlugin = viewer.getPlugin(MarkersPlugin);
     markersPlugin.addEventListener('select-marker', ({ marker }) => {
+      if (isPanoramaInteractionBlocked()) return;
       const markerConfig = (marker as any)?.config || {};
       const markerData = markerConfig.data || (marker as any)?.data || {};
       const sourceHotspotId = markerConfig.sourceHotspotId || markerData.sourceHotspotId;
@@ -1146,19 +1346,51 @@ const [viewerTick, setViewerTick] = React.useState(0);
     detachInertiaRef.current = inertia.detach;
     stopInertiaRef.current = inertia.stop;
     setEnabledInertiaRef.current = inertia.setEnabled;
-  }, [project, currentScene?.id, currentScene?.image, createNavigationHotspot, setActiveTool, setSelectedId, setCurrentScene, pushToast]);
+    if (isPanoramaInteractionBlocked()) setPreviewControlsEnabled(false);
+  }, [project, currentScene?.id, currentScene?.image, createNavigationHotspot, setActiveTool, setSelectedId, setCurrentScene, pushToast, isPanoramaInteractionBlocked, setPreviewControlsEnabled]);
 
   React.useEffect(() => {
+    const cancelDrag = (evt?: Event, restoreVisual = true) => {
+      const drag = draggingHotspotRef.current;
+      if (!drag) return;
+      if (evt && 'pointerId' in evt && Number((evt as PointerEvent).pointerId) !== drag.pointerId) return;
+      try {
+        if (containerRef.current?.hasPointerCapture?.(drag.pointerId)) {
+          containerRef.current.releasePointerCapture(drag.pointerId);
+        }
+      } catch {}
+      draggingHotspotRef.current = null;
+      lastHotspotClickRef.current = null;
+      document.body.style.cursor = '';
+      stopInertiaRef.current?.();
+      if (!isPanoramaInteractionBlocked()) {
+        try { (viewerRef.current as any)?.setOptions?.({ mousewheel: SHARED_VIEWER_MOTION.mousewheel }); } catch {}
+      }
+      // Dragging updates PSV directly for responsiveness. Re-render from the
+      // store on cancellation so the visible and persisted positions agree.
+      if (restoreVisual && drag.moved && useProjectStore.getState().currentSceneId === drag.sceneId) {
+        setViewerTick((value) => value + 1);
+      }
+    };
     const onHotspotDragMove = (evt: PointerEvent) => {
       const drag = draggingHotspotRef.current;
       if (!drag || !containerRef.current || !viewerRef.current) return;
+      if (evt.pointerId !== drag.pointerId) return;
       // Block PSV from seeing this pointermove (capture-phase listener fires first)
       evt.stopImmediatePropagation();
+      if (
+        isPanoramaInteractionBlocked()
+        || useProjectStore.getState().currentSceneId !== drag.sceneId
+      ) {
+        cancelDrag(evt);
+        return;
+      }
       const dx = evt.clientX - drag.startX;
       const dy = evt.clientY - drag.startY;
       if (!drag.moved && Math.sqrt(dx * dx + dy * dy) < 6) return;
       if (!drag.moved) {
         drag.moved = true;
+        lastHotspotClickRef.current = null;
         document.body.style.cursor = 'grabbing';
       }
       const rect = containerRef.current.getBoundingClientRect();
@@ -1197,6 +1429,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
     const onHotspotDragEnd = (evt: PointerEvent) => {
       const drag = draggingHotspotRef.current;
       if (!drag) return;
+      if (evt.pointerId !== drag.pointerId) return;
       // Stop PSV from seeing this pointerup — it never saw the pointerdown either,
       // and a stray pointerup leaves PSV's internal pointer-tracking in a broken state
       // that causes the camera to pan on the next mouse move.
@@ -1204,14 +1437,17 @@ const [viewerTick, setViewerTick] = React.useState(0);
       try { containerRef.current?.releasePointerCapture(evt.pointerId); } catch {}
       draggingHotspotRef.current = null;
       document.body.style.cursor = '';
-      try { (viewerRef.current as any)?.setOptions?.({ mousewheel: SHARED_VIEWER_MOTION.mousewheel }); } catch {}
+      const interactionBlocked = isPanoramaInteractionBlocked();
+      if (!interactionBlocked) {
+        try { (viewerRef.current as any)?.setOptions?.({ mousewheel: SHARED_VIEWER_MOTION.mousewheel }); } catch {}
+      }
+      if (interactionBlocked || useProjectStore.getState().currentSceneId !== drag.sceneId) return;
       if (!drag.moved) {
         useProjectStore.getState().setSelectedId(drag.hotspotId);
         return;
       }
       const state = useProjectStore.getState();
-      const sceneId = state.currentSceneId;
-      if (!sceneId) return;
+      const sceneId = drag.sceneId;
       const scene = state.project?.scenes.find((s) => s.id === sceneId);
       if (!scene) return;
       if (scene.hotspots.some((h) => h.id === drag.hotspotId)) {
@@ -1219,13 +1455,6 @@ const [viewerTick, setViewerTick] = React.useState(0);
       } else if (scene.markers.some((m) => m.id === drag.hotspotId)) {
         state.updateMarker(sceneId, drag.hotspotId, { yaw: drag.currentYaw, pitch: drag.currentPitch });
       }
-    };
-    const cancelDrag = () => {
-      if (!draggingHotspotRef.current) return;
-      draggingHotspotRef.current = null;
-      document.body.style.cursor = '';
-      stopInertiaRef.current?.();
-      try { (viewerRef.current as any)?.setOptions?.({ mousewheel: SHARED_VIEWER_MOTION.mousewheel }); } catch {}
     };
     // Capture phase on the container so our handlers fire before PSV's bubble-phase
     // listeners. setPointerCapture routes events here even when mouse leaves the element.
@@ -1235,35 +1464,97 @@ const [viewerTick, setViewerTick] = React.useState(0);
     dragContainer?.addEventListener('pointercancel', cancelDrag, true);
     window.addEventListener('blur', cancelDrag);
     return () => {
+      cancelDrag(undefined, false);
       dragContainer?.removeEventListener('pointermove', onHotspotDragMove, true);
       dragContainer?.removeEventListener('pointerup', onHotspotDragEnd, true);
       dragContainer?.removeEventListener('pointercancel', cancelDrag, true);
       window.removeEventListener('blur', cancelDrag);
     };
-  }, []);
+  }, [isPanoramaInteractionBlocked]);
 
   React.useEffect(() => {
     return () => {
+      panoramaLoadRequestRef.current += 1;
+      preloaderRef.current.cancelAll();
+      document.body.style.cursor = '';
       detachInertiaRef.current?.();
       detachInertiaRef.current = null;
       stopInertiaRef.current = null;
+      setEnabledInertiaRef.current = null;
       if (viewerRef.current) {
         viewerRef.current.destroy();
       }
       viewerRef.current = null;
       loadedPanoramaKeyRef.current = '';
+      if (initialPanoramaTimeoutRef.current) clearTimeout(initialPanoramaTimeoutRef.current);
+      initialPanoramaTimeoutRef.current = null;
+      initialPanoramaPendingKeyRef.current = null;
+      lastSuccessfulPanoramaRef.current = null;
     };
   }, []);
 
   React.useEffect(() => {
+    if (!viewerRef.current || !currentScene || !project) {
+      // Removing the last scene must also remove the old WebGL texture and
+      // marker DOM. Keeping the Viewer alive leaves the deleted panorama
+      // orbitable behind the empty-project overlay.
+      panoramaLoadRequestRef.current += 1;
+      loadedPanoramaKeyRef.current = '';
+      lastSuccessfulPanoramaRef.current = null;
+      if (initialPanoramaTimeoutRef.current) clearTimeout(initialPanoramaTimeoutRef.current);
+      initialPanoramaTimeoutRef.current = null;
+      initialPanoramaPendingKeyRef.current = null;
+      previewTransitioningRef.current = false;
+      pendingPreviewTargetRef.current = null;
+      previewEntryFromSceneRef.current = null;
+      previewEntryFromHotspotRef.current = null;
+      previewEntryOrientationRef.current = null;
+      previewEntryTargetSceneRef.current = null;
+      previewCarryZoomRef.current = null;
+      pendingTransitionRef.current = null;
+      preserveEditorZoomOnceRef.current = false;
+      document.body.style.cursor = '';
+      draggingHotspotRef.current = null;
+      detachInertiaRef.current?.();
+      detachInertiaRef.current = null;
+      stopInertiaRef.current = null;
+      setEnabledInertiaRef.current = null;
+      const staleViewer = viewerRef.current;
+      viewerRef.current = null;
+      if (staleViewer) {
+        try { (staleViewer as any)?.textureLoader?.abortLoading?.(); } catch {}
+        try { staleViewer.getPlugin(MarkersPlugin)?.setMarkers?.([]); } catch {}
+        try { staleViewer.destroy(); } catch {}
+      }
+      setPreviewControlsEnabled(true);
+      setIsSceneLoading(false);
+      setFailedSceneId(null);
+      return;
+    }
+
     if (viewerRef.current && currentScene && project) {
       const panoramaKey = `${currentScene.id}|${currentScene.image}`;
       if (!isSamePanoramaOrInflight(loadedPanoramaKeyRef.current, panoramaKey)) {
+        const viewer = viewerRef.current;
+        const previousSuccessfulPanorama = lastSuccessfulPanoramaRef.current;
+        const loadRequest = ++panoramaLoadRequestRef.current;
+        const isCurrentLoad = () => {
+          const state = useProjectStore.getState();
+          const activeScene = state.project?.scenes.find((scene) => scene.id === state.currentSceneId);
+          return (
+            panoramaLoadRequestRef.current === loadRequest
+            && viewerRef.current === viewer
+            && activeScene?.id === currentScene.id
+            && `${activeScene.id}|${activeScene.image}` === panoramaKey
+          );
+        };
         const targetPanorama = resolveAssetSrc(project, currentScene.image);
+        const hasPendingEntry = previewEntryTargetSceneRef.current === currentScene.id;
         const usePreviewCarryZoom = isPreviewRef.current
+          && hasPendingEntry
           && pendingPreviewTargetRef.current === currentScene.id
           && Number.isFinite(Number(previewCarryZoomRef.current));
-        const preserveEditorZoom = !isPreviewRef.current && preserveEditorZoomOnceRef.current;
+        const preserveEditorZoom = !isPreviewRef.current && hasPendingEntry && preserveEditorZoomOnceRef.current;
         const currentZoom = Number(viewerRef.current?.getZoomLevel?.());
         const targetZoom = usePreviewCarryZoom
           ? Number(previewCarryZoomRef.current)
@@ -1272,32 +1563,65 @@ const [viewerTick, setViewerTick] = React.useState(0);
           : (currentScene.initialZoom ?? 20);
         let entryYaw = Number.isFinite(Number(currentScene.initialYaw)) ? Number(currentScene.initialYaw) : 0;
         let entryPitch = Number.isFinite(Number(currentScene.initialPitch)) ? Number(currentScene.initialPitch) : 0;
-        if (previewEntryOrientationRef.current) {
+        if (hasPendingEntry && previewEntryOrientationRef.current) {
           entryYaw = previewEntryOrientationRef.current.yaw;
           entryPitch = previewEntryOrientationRef.current.pitch;
         }
+        if (initialPanoramaTimeoutRef.current) clearTimeout(initialPanoramaTimeoutRef.current);
+        initialPanoramaTimeoutRef.current = null;
+        initialPanoramaPendingKeyRef.current = null;
+        setFailedSceneId(null);
+        setModalCoords(null);
+        setModalType(null);
+        setIsDragOverViewer(false);
         setIsSceneLoading(true);
         loadedPanoramaKeyRef.current = `loading:${panoramaKey}`;
-        stopInertiaRef.current?.();
-        const pendingTransition = pendingTransitionRef.current;
+        setPreviewControlsEnabled(false);
+        const pendingTransition = hasPendingEntry ? pendingTransitionRef.current : null;
         const fadeDuration = pendingTransition
           ? Math.max(500, Math.min(2000, pendingTransition.duration))
           : SHARED_VIEWER_TRANSITION.duration;
         // PSV skips transition automatically when state.ready is false (first load),
         // so we always pass the fade option and let PSV decide.
         const transitionOption = { speed: fadeDuration, effect: SHARED_VIEWER_TRANSITION.effect, rotation: false };
-        void viewerRef.current.setPanorama(targetPanorama, {
-          caption: currentScene.name,
-          transition: transitionOption as any,
-          showLoader: false,
-          position: { yaw: entryYaw, pitch: entryPitch },
-          defaultYaw: entryYaw,
-          defaultPitch: entryPitch,
-          zoom: targetZoom,
-        })
-          .then(() => {
+        void (async () => {
+          let loadFailed = false;
+          try {
+            const completed = await withPanoramaLoadTimeout(
+              viewer.setPanorama(targetPanorama, {
+                caption: currentScene.name,
+                transition: transitionOption as any,
+                showLoader: false,
+                position: { yaw: entryYaw, pitch: entryPitch },
+                defaultYaw: entryYaw,
+                defaultPitch: entryPitch,
+                zoom: targetZoom,
+              }),
+              () => {
+                // A stale timeout must never abort the texture request owned by a
+                // newer rapid scene switch on the same Viewer instance.
+                if (!isCurrentLoad()) return;
+                try { (viewer as any)?.textureLoader?.abortLoading?.(); } catch {}
+                try { (viewer as any)?.state?.transitionAnimation?.cancel?.(); } catch {}
+                try { (viewer as any)?.loader?.hide?.(); } catch {}
+                try { viewer.hideError(); } catch {}
+              },
+            );
+            if (!isCurrentLoad()) return;
+            if (completed === false) {
+              loadFailed = true;
+              loadedPanoramaKeyRef.current = '';
+              if (!isPreviewRef.current) {
+                pushToast('error', 'Could not load this panorama image. Verify the file exists and is a valid 360° photo.');
+              }
+              return;
+            }
             loadedPanoramaKeyRef.current = panoramaKey;
-            viewerRef.current?.rotate?.({ yaw: entryYaw, pitch: entryPitch });
+            lastSuccessfulPanoramaRef.current = { sceneId: currentScene.id, key: panoramaKey };
+            // A pointer press during the previous scene may have left an old target
+            // behind. Rebase from the completed panorama before restoring controls.
+            stopInertiaRef.current?.();
+            viewer.rotate?.({ yaw: entryYaw, pitch: entryPitch });
             if (isPreviewRef.current && pendingPreviewTargetRef.current === currentScene.id) {
               pendingPreviewTargetRef.current = null;
             }
@@ -1307,36 +1631,93 @@ const [viewerTick, setViewerTick] = React.useState(0);
               : preserveEditorZoom && Number.isFinite(Number(targetZoom))
               ? Number(targetZoom)
               : sceneZoom;
-            viewerRef.current?.zoom?.(finalZoom);
-            previewTransitioningRef.current = false;
-            previewEntryFromSceneRef.current = null;
-            previewEntryFromHotspotRef.current = null;
-            previewEntryOrientationRef.current = null;
-            previewCarryZoomRef.current = null;
-            pendingTransitionRef.current = null;
-            preserveEditorZoomOnceRef.current = false;
-            setPreviewControlsEnabled(true);
-            setIsSceneLoading(false);
+            viewer.zoom?.(finalZoom);
             // Delay marker rendering by one RAF frame so PSV has rendered the new
             // camera position before setMarkers positions the hotspot DOM elements.
             // Without this, markers briefly appear at stale positions then snap.
-            requestAnimationFrame(() => { requestAnimationFrame(() => { requestAnimationFrame(() => { setViewerTick((n) => n + 1); }); }); });
-          })
-          .catch(() => {
-            previewTransitioningRef.current = false;
-            previewEntryFromSceneRef.current = null;
-            previewEntryFromHotspotRef.current = null;
-            previewEntryOrientationRef.current = null;
-            previewCarryZoomRef.current = null;
-            pendingTransitionRef.current = null;
-            preserveEditorZoomOnceRef.current = false;
+            requestAnimationFrame(() => {
+              if (!isCurrentLoad()) return;
+              requestAnimationFrame(() => {
+                if (!isCurrentLoad()) return;
+                requestAnimationFrame(() => {
+                  if (isCurrentLoad()) setViewerTick((n) => n + 1);
+                });
+              });
+            });
+          } catch {
+            if (!isCurrentLoad()) return;
+            loadFailed = true;
             loadedPanoramaKeyRef.current = '';
-            setPreviewControlsEnabled(true);
-            setIsSceneLoading(false);
+            try { (viewer as any)?.loader?.hide?.(); } catch {}
+            try { viewer.hideError(); } catch {}
             if (!isPreviewRef.current) {
               pushToast('error', 'Could not load this panorama image. Verify the file exists and is a valid 360° photo.');
             }
-          });
+          } finally {
+            // An aborted older request must not unlock input or clear state owned by
+            // the newer panorama that replaced it.
+            if (!isCurrentLoad()) return;
+            previewTransitioningRef.current = false;
+            if (pendingPreviewTargetRef.current === currentScene.id) {
+              pendingPreviewTargetRef.current = null;
+            }
+            previewEntryFromSceneRef.current = null;
+            previewEntryFromHotspotRef.current = null;
+            previewEntryOrientationRef.current = null;
+            previewEntryTargetSceneRef.current = null;
+            previewCarryZoomRef.current = null;
+            pendingTransitionRef.current = null;
+            preserveEditorZoomOnceRef.current = false;
+
+            let keepControlsLocked = false;
+            if (loadFailed) {
+              try { (viewer as any)?.loader?.hide?.(); } catch {}
+              const state = useProjectStore.getState();
+              const previousScene = previousSuccessfulPanorama
+                ? state.project?.scenes.find((scene) => scene.id === previousSuccessfulPanorama.sceneId)
+                : null;
+              const previousKey = previousScene ? `${previousScene.id}|${previousScene.image}` : '';
+              const canReusePreviousPanorama = !!(
+                previousScene
+                && previousSuccessfulPanorama
+                && previousKey === previousSuccessfulPanorama.key
+              );
+              const canReloadPreviousScene = !!(
+                previousScene
+                && previousSuccessfulPanorama
+                && previousScene.id !== currentScene.id
+              );
+
+              // In the editor keep the failing scene selected (so it can be repaired and
+              // retried); only preview navigation falls back to the previous scene.
+              if (isPreviewRef.current && previousScene && (canReusePreviousPanorama || canReloadPreviousScene)) {
+                if (canReusePreviousPanorama && state.project) {
+                  // setPanorama updates config before its texture promise settles.
+                  // Restore that metadata together with the still-rendered texture.
+                  try {
+                    const rawViewer = viewer as any;
+                    rawViewer.config.panorama = resolveAssetSrc(state.project, previousScene.image);
+                    rawViewer.config.caption = previousScene.name;
+                    rawViewer.navbar?.setCaption?.(previousScene.name);
+                    rawViewer.loader?.hide?.();
+                    rawViewer.hideError?.();
+                  } catch {}
+                }
+                loadedPanoramaKeyRef.current = canReusePreviousPanorama ? previousKey : '';
+                setFailedSceneId(null);
+                keepControlsLocked = !canReusePreviousPanorama;
+                state.setCurrentScene(previousScene.id);
+                if (canReusePreviousPanorama) setViewerTick((n) => n + 1);
+              } else {
+                loadedPanoramaKeyRef.current = '';
+                setFailedSceneId(currentScene.id);
+              }
+            }
+
+            setPreviewControlsEnabled(!keepControlsLocked);
+            setIsSceneLoading(keepControlsLocked);
+          }
+        })();
       }
       const markersPlugin = viewerRef.current.getPlugin(MarkersPlugin);
 
@@ -1455,9 +1836,28 @@ const [viewerTick, setViewerTick] = React.useState(0);
         onDrop={handleViewerDrop}
       />
       {isSceneLoading && (
-        <div className="absolute inset-0 z-20 pointer-events-none flex items-center justify-center bg-slate-950/22 backdrop-blur-[1px]">
+        <div className="absolute inset-0 z-20 pointer-events-auto flex items-center justify-center bg-slate-950/22 backdrop-blur-[1px]">
           <div className="px-3 py-1.5 rounded-full border border-white/20 bg-slate-900/65 text-[11px] text-white/90 tracking-wide">
             Loading scene...
+          </div>
+        </div>
+      )}
+      {!isSceneLoading && !!failedSceneId && failedSceneId === currentSceneId && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/55 backdrop-blur-[1px]">
+          <div className="rounded-xl border border-red-400/30 bg-slate-900/90 px-5 py-4 text-center shadow-xl">
+            <div className="text-sm font-semibold text-slate-100">Scene could not be loaded</div>
+            <div className="mt-1 text-xs text-slate-400">Check the panorama file, then try again.</div>
+            <button
+              type="button"
+              className="mt-3 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-white hover:bg-primary/90"
+              onClick={() => {
+                loadedPanoramaKeyRef.current = '';
+                setFailedSceneId(null);
+                setViewerTick((n) => n + 1);
+              }}
+            >
+              Retry scene
+            </button>
           </div>
         </div>
       )}
@@ -1494,7 +1894,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
         </div>
       )}
 
-      {!isPreview && modalCoords && modalType === 'hotspot' && (
+      {!isPreview && !isPanoramaInteractionBlocked() && modalCoords && modalType === 'hotspot' && (
           <AddHotspotModal
             sceneId={currentSceneId!}
             coords={modalCoords}
@@ -1509,7 +1909,7 @@ const [viewerTick, setViewerTick] = React.useState(0);
         />
       )}
 
-      {!isPreview && modalCoords && modalType === 'marker' && (
+      {!isPreview && !isPanoramaInteractionBlocked() && modalCoords && modalType === 'marker' && (
         <AddMarkerModal sceneId={currentSceneId!} coords={modalCoords} onClose={() => { setModalCoords(null); setModalType(null); setActiveTool('select'); }} />
       )}
 
@@ -1547,12 +1947,3 @@ const [viewerTick, setViewerTick] = React.useState(0);
 };
 
 export default PanoramaViewer;
-
-
-
-
-
-
-
-
-

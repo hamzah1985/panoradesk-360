@@ -1,15 +1,36 @@
 import React from 'react';
-import { useProjectStore } from '../../store/projectStore';
+import {
+  captureProjectSession,
+  deleteProject,
+  openPathInFileManager,
+  ownsProjectSession,
+  runProjectOperation,
+  useProjectStore,
+  type ProjectSessionToken,
+} from '../../store/projectStore';
 import { Settings, X, Building2, Palette, Image as ImageIcon, FolderOpen, ExternalLink, Trash2, Copy, CalendarDays, Map as MapIcon, Eye, GalleryHorizontal, Plus } from 'lucide-react';
 import { getDesktopApi } from '../../lib/desktop';
 import { resolveAssetSrc } from '../../lib/media';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
-import { openPathInFileManager, deleteProject } from '../../store/projectStore';
 import { useUiStore } from '../../store/uiStore';
-import { AppMode } from '../../types';
+import { AppMode, type Project } from '../../types';
 
 interface ProjectSettingsModalProps {
   onClose: () => void;
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error(`Failed to read ${file.name}`));
+    reader.onabort = () => reject(new Error(`Reading ${file.name} was canceled`));
+    try {
+      reader.readAsDataURL(file);
+    } catch (error) {
+      reject(error);
+    }
+  });
 }
 
 const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) => {
@@ -21,10 +42,36 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
   const floorPlanInputRef = React.useRef<HTMLInputElement>(null);
   const logoInputRef = React.useRef<HTMLInputElement>(null);
   const galleryInputRef = React.useRef<HTMLInputElement>(null);
+  const mountedRef = React.useRef(true);
   useEscapeClose(true, onClose);
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const captureProjectOwner = React.useCallback(
+    (projectId: string): ProjectSessionToken => captureProjectSession(projectId),
+    [],
+  );
+
+  // Persistent upload completions belong to the editor session, not to this
+  // modal's mounted lifetime. Closing Settings must not discard a file that
+  // was already copied/read successfully.
+  const ownsProject = React.useCallback((owner: ProjectSessionToken) => ownsProjectSession(owner), []);
+  const ownsMountedProject = React.useCallback((owner: ProjectSessionToken) => (
+    mountedRef.current && ownsProjectSession(owner)
+  ), []);
+
+  const updateOwnedProject = React.useCallback((owner: ProjectSessionToken, updates: Partial<Project>) => {
+    if (!ownsProject(owner)) return false;
+    useProjectStore.getState().updateProject(updates);
+    return true;
+  }, [ownsProject]);
 
   const handleDeleteProject = React.useCallback(() => {
     if (!project?.id) return;
+    const owner = captureProjectOwner(project.id);
     openConfirm({
       title: 'Delete Project',
       message: `Permanently delete "${project.name}" from disk? This cannot be undone.`,
@@ -32,32 +79,44 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
       cancelLabel: 'Cancel',
       tone: 'danger',
       onConfirm: async () => {
+        if (!ownsMountedProject(owner)) return;
         setIsDeleting(true);
         try {
           const deleted = await deleteProject(project.id, project.path);
-          if (!deleted) { pushToast('error', 'Failed to delete project from disk'); setIsDeleting(false); return; }
+          if (!ownsProject(owner)) return;
+          if (!deleted) {
+            pushToast('error', 'Failed to delete project from disk');
+            if (mountedRef.current) setIsDeleting(false);
+            return;
+          }
           pushToast('success', 'Project deleted');
+          if (mountedRef.current) onClose();
           setProject(null);
           setMode(AppMode.DASHBOARD);
-          onClose();
         } catch {
-          pushToast('error', 'Failed to delete project from disk');
-          setIsDeleting(false);
+          if (ownsProject(owner)) {
+            pushToast('error', 'Failed to delete project from disk');
+            if (mountedRef.current) setIsDeleting(false);
+          }
         }
       },
     });
-  }, [project, openConfirm, pushToast, setProject, setMode, onClose]);
+  }, [project, openConfirm, pushToast, setProject, setMode, onClose, captureProjectOwner, ownsProject, ownsMountedProject]);
 
   const handleFloorPlanUpload = async () => {
     const desktop = getDesktopApi();
     if (desktop && project) {
-      try {
-        const result = await desktop.uploadFloorPlan(project);
-        if (!result) return;
-        updateProject({ floorPlanImage: result.path, path: result.projectPath });
-      } catch {
-        pushToast('error', 'Failed to upload floor plan');
-      }
+      const ownerProject = project;
+      const owner = captureProjectOwner(ownerProject.id);
+      await runProjectOperation(ownerProject.id, async () => {
+        try {
+          const result = await desktop.uploadFloorPlan(ownerProject);
+          if (!result) return;
+          updateOwnedProject(owner, { floorPlanImage: result.path, path: result.projectPath });
+        } catch {
+          if (ownsProject(owner)) pushToast('error', 'Failed to upload floor plan');
+        }
+      });
     } else {
       floorPlanInputRef.current?.click();
     }
@@ -65,27 +124,36 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
 
   const handleFloorPlanFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      updateProject({ floorPlanImage: reader.result as string });
-      pushToast('success', `Floor plan "${file.name}" uploaded`);
-    };
-    reader.onerror = () => pushToast('error', 'Failed to read floor plan image');
-    reader.readAsDataURL(file);
+    const ownerProjectId = project?.id;
     e.target.value = '';
+    if (!file || !ownerProjectId) return;
+    const owner = captureProjectOwner(ownerProjectId);
+    void runProjectOperation(ownerProjectId, async () => {
+      try {
+        const src = await readFileAsDataUrl(file);
+        if (updateOwnedProject(owner, { floorPlanImage: src })) {
+          pushToast('success', `Floor plan "${file.name}" uploaded`);
+        }
+      } catch {
+        if (ownsProject(owner)) pushToast('error', 'Failed to read floor plan image');
+      }
+    });
   };
 
   const handleLogoUpload = async () => {
     const desktop = getDesktopApi();
     if (desktop && project) {
-      try {
-        const result = await desktop.uploadLogo(project);
-        if (!result) return;
-        updateProject({ logo: result.path, path: result.projectPath });
-      } catch {
-        pushToast('error', 'Failed to upload logo');
-      }
+      const ownerProject = project;
+      const owner = captureProjectOwner(ownerProject.id);
+      await runProjectOperation(ownerProject.id, async () => {
+        try {
+          const result = await desktop.uploadLogo(ownerProject);
+          if (!result) return;
+          updateOwnedProject(owner, { logo: result.path, path: result.projectPath });
+        } catch {
+          if (ownsProject(owner)) pushToast('error', 'Failed to upload logo');
+        }
+      });
     } else {
       logoInputRef.current?.click();
     }
@@ -93,15 +161,20 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
 
   const handleLogoFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      updateProject({ logo: reader.result as string });
-      pushToast('success', `Logo "${file.name}" uploaded`);
-    };
-    reader.onerror = () => pushToast('error', 'Failed to read logo image');
-    reader.readAsDataURL(file);
+    const ownerProjectId = project?.id;
     e.target.value = '';
+    if (!file || !ownerProjectId) return;
+    const owner = captureProjectOwner(ownerProjectId);
+    void runProjectOperation(ownerProjectId, async () => {
+      try {
+        const src = await readFileAsDataUrl(file);
+        if (updateOwnedProject(owner, { logo: src })) {
+          pushToast('success', `Logo "${file.name}" uploaded`);
+        }
+      } catch {
+        if (ownsProject(owner)) pushToast('error', 'Failed to read logo image');
+      }
+    });
   };
 
   const normalizedWebsite = React.useMemo(() => {
@@ -127,20 +200,32 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
     };
   }, []);
 
-  const handleGalleryFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleGalleryFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []) as File[];
-    if (files.length === 0) return;
-    files.forEach((file) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const src = reader.result as string;
-        const current = project?.galleryImages ?? [];
-        updateProject({ galleryImages: [...current, src] });
-      };
-      reader.onerror = () => pushToast('error', `Failed to read "${file.name}"`);
-      reader.readAsDataURL(file);
-    });
+    const ownerProjectId = project?.id;
     e.target.value = '';
+    if (files.length === 0 || !ownerProjectId) return;
+    const owner = captureProjectOwner(ownerProjectId);
+
+    await runProjectOperation(ownerProjectId, async () => {
+      const results = await Promise.all(files.map(async (file) => {
+        try {
+          return await readFileAsDataUrl(file);
+        } catch {
+          if (ownsProject(owner)) pushToast('error', `Failed to read "${file.name}"`);
+          return null;
+        }
+      }));
+      const added = results.filter((src): src is string => !!src);
+      if (added.length === 0) return;
+
+      // Read every selected file first, then append once against the latest
+      // gallery state. Per-reader writes all captured the same old array and the
+      // last callback used to overwrite the other selected images.
+      const state = useProjectStore.getState();
+      if (!ownsProject(owner) || state.project?.id !== ownerProjectId) return;
+      updateOwnedProject(owner, { galleryImages: [...(state.project.galleryImages ?? []), ...added] });
+    });
   };
 
   const removeGalleryImage = (index: number) => {
@@ -165,7 +250,8 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
           </button>
         </div>
 
-        <div className="p-8 overflow-y-auto custom-scrollbar grid grid-cols-2 gap-8 text-sm">
+        <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
+        <div className="p-8 grid grid-cols-2 gap-8 text-sm">
           <div className="space-y-6">
             <div>
               <label className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2 flex items-center gap-2">
@@ -316,7 +402,23 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
                         Change
                       </button>
                       <button
-                        onClick={() => updateProject({ floorPlanImage: undefined })}
+                        onClick={() => openConfirm({
+                          title: 'Remove Floor Plan',
+                          message: 'Remove the floor plan image and all scene pins from this project?',
+                          confirmLabel: 'Remove',
+                          cancelLabel: 'Cancel',
+                          tone: 'danger',
+                          onConfirm: () => {
+                            const latest = useProjectStore.getState().project;
+                            if (!latest || latest.id !== project.id) return;
+                            // Pins are coordinates in this specific image; keeping
+                            // them would resurrect stale positions on a new plan.
+                            useProjectStore.getState().updateProject({
+                              floorPlanImage: undefined,
+                              scenes: latest.scenes.map((scene) => ({ ...scene, floorPlan: undefined })),
+                            });
+                          },
+                        })}
                         className="px-2.5 py-1.5 rounded-md border border-red-300/60 text-red-100 text-xs font-bold uppercase tracking-wider hover:bg-red-500/20"
                       >
                         <span className="inline-flex items-center gap-1">
@@ -400,7 +502,7 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
           <div className="grid grid-cols-4 gap-2">
             {(project.galleryImages ?? []).map((src, index) => (
               <div key={index} className="group relative aspect-video rounded-xl overflow-hidden border border-slate-200 bg-slate-50">
-                <img src={src} alt={`Gallery ${index + 1}`} className="w-full h-full object-cover" loading="lazy" />
+                <img src={resolveAssetSrc(project, src)} alt={`Gallery ${index + 1}`} className="w-full h-full object-cover" loading="lazy" />
                 <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                   <button
                     type="button"
@@ -439,6 +541,7 @@ const ProjectSettingsModal: React.FC<ProjectSettingsModalProps> = ({ onClose }) 
               {isDeleting ? 'Deleting…' : 'Delete Project'}
             </button>
           </div>
+        </div>
         </div>
 
         <div className="p-6 bg-slate-50 border-t border-slate-100 flex items-center justify-between">

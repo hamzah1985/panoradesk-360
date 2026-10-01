@@ -4,6 +4,7 @@
 
 import { SHARED_VIEWER_INERTIA, SHARED_VIEWER_MOTION, SHARED_VIEWER_TRANSITION } from '../lib/viewerMotion';
 import { attachViewerInertia } from '../lib/viewerInertia';
+import { createPanoramaPreloader, setPanoramaBounded } from '../lib/panoramaLoad';
 import {
   buildHotspotInnerHtml,
   wrapHotspotHtml,
@@ -42,6 +43,7 @@ interface HotspotData {
   targetYaw?: number;
   targetPitch?: number;
   customTargetView?: boolean;
+  transitionDuration?: number;
   navigationMode?: 'original' | 'marzipano' | 'pannellum';
 }
 
@@ -50,6 +52,9 @@ interface SceneMarker {
   yaw: number;
   pitch: number;
   title?: string;
+  description?: string;
+  image?: string;
+  link?: string;
   iconData?: string;
 }
 
@@ -99,23 +104,45 @@ interface Project {
 const FALLBACK_INFO_ICON = 'data:image/svg+xml;utf8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 10v6"/><circle cx="12" cy="7.5" r="1" fill="#3b82f6"/></svg>',
 );
+const TOUR_DATA_TIMEOUT_MS = 15_000;
+
+function escapeHtml(value: unknown) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function normalizeExternalUrl(value: unknown) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  try {
+    const parsed = new URL(withProtocol);
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function fetchJsonBounded(url: string) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), TOUR_DATA_TIMEOUT_MS);
+  return fetch(url, { signal: controller.signal })
+    .catch((error) => {
+      if (controller.signal.aborted) {
+        throw new Error('Tour data request timed out. Check the connection and try again.');
+      }
+      throw error;
+    })
+    .finally(() => window.clearTimeout(timeoutId));
+}
 
 async function boot() {
-  // Defensive cache busting for hosted embeds/pages with legacy service workers.
-  try {
-    if ('serviceWorker' in navigator) {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((reg) => reg.unregister()));
-    }
-    if ('caches' in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.map((key) => caches.delete(key)));
-    }
-  } catch {
-    // Ignore cache/SW cleanup failures.
-  }
-
-  const response = await fetch('./assets/tour.json');
+  const response = await fetchJsonBounded('./assets/tour.json');
+  if (!response.ok) throw new Error(`Tour data request failed (${response.status})`);
   const project: Project = await response.json();
 
   document.documentElement.style.setProperty('--accent', project.primaryColor || '#C8A96A');
@@ -141,7 +168,7 @@ async function boot() {
   const isMobileLike = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
     || (typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)')?.matches);
 
-  const first = project.scenes?.[0];
+  const first = (project.scenes || []).find((scene) => !!scene.image);
   const plugins: any[] = [
     [MarkersPlugin, { markers: [], clickEventOnMarker: true }],
   ];
@@ -152,7 +179,6 @@ async function boot() {
 
   const viewer = new Viewer({
     container: 'viewer',
-    panorama: first?.image,
     caption: first?.name,
     defaultZoomLvl: first?.initialZoom ?? 20,
     defaultYaw: first?.initialYaw || 0,
@@ -183,9 +209,36 @@ async function boot() {
         alphaIdle: SHARED_VIEWER_INERTIA.alphaIdle,
         minFovDeg: SHARED_VIEWER_MOTION.minFov,
         maxFovDeg: SHARED_VIEWER_MOTION.maxFov,
+        onInteractionStart: () => setAutorotate(false),
       })
     : null;
   const stopInertia = () => inertia?.stop?.();
+  const stopViewerMotion = (dispatchStopAll = true) => {
+    stopInertia();
+    try {
+      // Native touch momentum is owned by PSV's EventsHandler rather than its
+      // public dynamics objects. stopAll dispatches the event that clears it.
+      if (dispatchStopAll) void (viewer as any).stopAll?.();
+      const dynamics = (viewer as any).dynamics;
+      dynamics?.position?.stop?.();
+      dynamics?.zoom?.stop?.();
+      void viewer.stopAnimation?.();
+    } catch { }
+  };
+  const setNavigationControlsEnabled = (enabled: boolean) => {
+    const controlsEnabled = enabled
+      && !navigationInProgress
+      && !vrChangeInProgress
+      && !stereoPlugin?.isEnabled?.()
+      && navigationVrDesired !== true;
+    inertia?.setEnabled?.(controlsEnabled);
+    try {
+      viewer.setOptions?.({
+        mousewheel: controlsEnabled ? SHARED_VIEWER_MOTION.mousewheel : false,
+        mousemove: controlsEnabled ? (isMobileLike ? true : SHARED_VIEWER_MOTION.mousemove) : false,
+      });
+    } catch { }
+  };
 
   const markersPlugin = viewer.getPlugin(MarkersPlugin);
   const getPluginSafe = (pluginCtor: any) => { try { return pluginCtor ? viewer.getPlugin(pluginCtor) : null; } catch { return null; } };
@@ -216,15 +269,110 @@ async function boot() {
   const prevSceneBtn = document.getElementById('pdPrevScene') as HTMLButtonElement | null;
   const nextSceneBtn = document.getElementById('pdNextScene') as HTMLButtonElement | null;
 
-  let currentSceneId = first?.id || '';
+  interface SceneNavigationOptions {
+    skipTransition?: boolean;
+    skipIntro?: boolean;
+    entryYaw?: number;
+    entryPitch?: number;
+    forceReload?: boolean;
+    initialLoad?: boolean;
+    forceLoadingOverlay?: boolean;
+    transitionDuration?: number;
+  }
+  interface NavigationRequest {
+    id: number;
+    sceneId: string;
+    options: SceneNavigationOptions;
+    resolve: (loaded: boolean) => void;
+  }
+
+  let currentSceneId = '';
   let hotspotsVisible = true;
   let vrEnabled = !!stereoPlugin?.isEnabled?.();
   let autorotateEnabled = false;
   let galleryVisible = false;
   let navigationInProgress = false;
+  let vrChangeInProgress = false;
+  let vrOperationId = 0;
+  let vrChangePromise: Promise<boolean> | null = null;
+  let navigationRequestId = 0;
+  let pendingNavigation: NavigationRequest | null = null;
+  let activeNavigation: NavigationRequest | null = null;
+  let activeNavigationAbort: AbortController | null = null;
+  let navigationWorkerPromise: Promise<void> | null = null;
+  let navigationVrDesired: boolean | null = null;
   let introTimer: ReturnType<typeof setTimeout> | null = null;
-  const preloadCache = new Set<string>();
-  const preloadInflight = new Set<string>();
+  const preloader = createPanoramaPreloader();
+
+  function setLoadingOverlay(message: string, force = false) {
+    if (!force && !project.exportSettings?.showLoadingScreen) return;
+    loadingOverlay.dataset.state = 'loading';
+    loadingOverlay.style.display = 'flex';
+    loadingOverlay.innerHTML = '';
+    const box = document.createElement('div');
+    box.className = 'box';
+    const spinner = document.createElement('div');
+    spinner.className = 'spinner';
+    const text = document.createElement('div');
+    text.textContent = message;
+    box.append(spinner, text);
+    loadingOverlay.appendChild(box);
+  }
+
+  function hideLoadingOverlay() {
+    loadingOverlay.dataset.state = '';
+    loadingOverlay.style.display = 'none';
+  }
+
+  function showSceneLoadError(scene: ProjectScene, retry: () => void, canDismiss: boolean) {
+    loadingOverlay.dataset.state = 'error';
+    loadingOverlay.style.display = 'flex';
+    loadingOverlay.innerHTML = '';
+    const box = document.createElement('div');
+    box.className = 'box';
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:8px';
+    title.textContent = `Could not load ${scene.name || 'this scene'}`;
+    const description = document.createElement('div');
+    description.style.cssText = 'font-size:12px;opacity:.75;max-width:420px;line-height:1.5;margin-bottom:14px';
+    description.textContent = 'The panorama did not finish loading. Check the connection or exported image, then try again.';
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;gap:8px;justify-content:center';
+    const retryButton = document.createElement('button');
+    retryButton.type = 'button';
+    retryButton.textContent = 'Retry';
+    retryButton.style.cssText = 'border:0;border-radius:8px;padding:8px 14px;cursor:pointer;background:var(--accent);color:#111;font-weight:700';
+    retryButton.addEventListener('click', retry, { once: true });
+    actions.appendChild(retryButton);
+    if (canDismiss) {
+      const dismissButton = document.createElement('button');
+      dismissButton.type = 'button';
+      dismissButton.textContent = 'Return to current scene';
+      dismissButton.style.cssText = 'border:1px solid rgba(255,255,255,.25);border-radius:8px;padding:8px 14px;cursor:pointer;background:transparent;color:inherit';
+      dismissButton.addEventListener('click', hideLoadingOverlay, { once: true });
+      actions.appendChild(dismissButton);
+    } else {
+      const alternateScene = (project.scenes || []).find((candidate) => candidate.id !== scene.id && !!candidate.image);
+      if (alternateScene) {
+        const alternateButton = document.createElement('button');
+        alternateButton.type = 'button';
+        alternateButton.textContent = 'Open another scene';
+        alternateButton.style.cssText = 'border:1px solid rgba(255,255,255,.25);border-radius:8px;padding:8px 14px;cursor:pointer;background:transparent;color:inherit';
+        alternateButton.addEventListener('click', () => {
+          setLoadingOverlay(`Loading ${alternateScene.name || 'scene'}...`, true);
+          void updateScene(alternateScene.id, {
+            skipTransition: true,
+            initialLoad: true,
+            forceReload: true,
+            forceLoadingOverlay: true,
+          });
+        }, { once: true });
+        actions.appendChild(alternateButton);
+      }
+    }
+    box.append(title, description, actions);
+    loadingOverlay.appendChild(box);
+  }
 
   function openMenu() {
     menuPanel?.classList.remove('pdHidden');
@@ -242,18 +390,16 @@ async function boot() {
     return (project.scenes || []).find((s) => s.id === sceneId) || null;
   }
 
-  async function preloadScenePanorama(sceneId: string) {
+  function getNavigableScenes() {
+    return (project.scenes || []).filter((scene) => !!scene.image);
+  }
+
+  async function preloadScenePanorama(sceneId: string, signal?: AbortSignal) {
     const scene = getSceneById(sceneId);
-    if (!scene || !scene.image) return;
-    const src = String(scene.image || '');
-    if (!src || preloadCache.has(src) || preloadInflight.has(src)) return;
-    preloadInflight.add(src);
-    await new Promise<void>((resolve) => {
-      const img = new Image();
-      img.onload = () => { preloadCache.add(src); preloadInflight.delete(src); resolve(); };
-      img.onerror = () => { preloadInflight.delete(src); resolve(); };
-      img.src = src;
-    });
+    const src = String(scene?.image || '');
+    if (!src) return false;
+    // A signal means a navigation is about to show this scene: skip the queue.
+    return preloader.preload(src, { signal, priority: !!signal });
   }
 
   function setBtnState(button: HTMLElement | null, active: boolean) {
@@ -276,28 +422,55 @@ async function boot() {
   }
 
   function buildSceneMarkers(scene: ProjectScene) {
-    const navMarkers = hotspotsVisible ? (scene.hotspots || []).flatMap((h) => {
+    const usedMarkerIds = new Set<string>();
+    const validHotspots = (scene.hotspots || []).filter((h) => {
+      const id = String(h?.id || '');
+      const target = getSceneById(String(h?.targetSceneId || ''));
+      if (!id || usedMarkerIds.has(id) || !target?.image || target.id === scene.id) return false;
+      if (!Number.isFinite(Number(h?.yaw)) || !Number.isFinite(Number(h?.pitch))) return false;
+      usedMarkerIds.add(id);
+      return true;
+    });
+    const navMarkers = hotspotsVisible ? validHotspots.flatMap((h) => {
+      const yaw = normalizeYaw(Number(h.yaw));
+      const pitch = clampPitch(Number(h.pitch));
       const icon = normalizeHotspotIconId(h?.icon || project.hotspotStyle?.iconType || 'nav-default');
       const color = h?.color || project.hotspotStyle?.color || '#ffffff';
-      const size = Math.max(32, Math.round(Number(h?.size || project.hotspotStyle?.size || 70)));
+      const sizeValue = Number(h?.size ?? project.hotspotStyle?.size ?? 70);
+      const size = Math.max(32, Math.min(240, Math.round(Number.isFinite(sizeValue) ? sizeValue : 70)));
+      const label = String(h?.label || '').trim();
+      const labelHtml = label
+        ? `<div style="margin-top:6px;pointer-events:none;max-width:180px;padding:4px 8px;border-radius:9999px;background:rgba(0,0,0,.72);border:1px solid rgba(255,255,255,.28);box-shadow:0 2px 8px rgba(0,0,0,.35);color:#fff;font-size:11px;font-weight:700;line-height:1.2;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(label)}</div>`
+        : '';
+      const tooltip = label
+        ? { content: escapeHtml(label), position: 'top center' }
+        : undefined;
       const markerData = {
         targetSceneId: h.targetSceneId,
         targetYaw: h.targetYaw,
         targetPitch: h.targetPitch,
         customTargetView: h.customTargetView === true,
+        transitionDuration: h.transitionDuration,
         navigationMode: h.navigationMode || 'marzipano',
         sourceSceneId: scene.id,
         sourceHotspotId: h.id,
       };
 
       if (isProjectedFloorIcon(icon)) {
-        return buildProjectedFloorMarkers(
-          h.yaw, h.pitch, h.id, icon, color, size,
+        const projectedMarkers = buildProjectedFloorMarkers(
+          yaw, pitch, h.id, icon, color, size,
           h?.pulseSpeed ?? project.hotspotStyle?.pulseSpeed,
           h?.ringCount ?? project.hotspotStyle?.ringCount,
           markerData,
-          h.label,
+          tooltip,
         ) as any[];
+        if (labelHtml) {
+          const hitMarker = projectedMarkers.find((marker) => marker?.id === h.id && typeof marker?.html === 'string');
+          if (hitMarker) {
+            hitMarker.html = `<div style="display:flex;flex-direction:column;align-items:center">${hitMarker.html}${labelHtml}</div>`;
+          }
+        }
+        return projectedMarkers;
       }
 
       const animation = h?.animation || project.hotspotStyle?.animation;
@@ -316,21 +489,62 @@ async function boot() {
       return [{
         id: h.id,
         type: 'html',
-        html: wrapHotspotHtml(innerHtml, animation || ''),
-        position: { yaw: h.yaw, pitch: h.pitch },
+        html: `<div style="display:flex;flex-direction:column;align-items:center">${wrapHotspotHtml(innerHtml, animation || '')}${labelHtml}</div>`,
+        position: { yaw, pitch },
         anchor: 'center center',
+        tooltip,
         data: markerData,
       }];
     }) : [];
 
-    const infoMarkers = (scene.markers || []).map((m) => ({
-      id: m.id, type: 'image',
-      image: m.iconData || FALLBACK_INFO_ICON,
-      width: 30, height: 30,
-      position: { yaw: m.yaw, pitch: m.pitch },
-    }));
+    const infoMarkers = (scene.markers || []).flatMap((m) => {
+      const id = String(m?.id || '');
+      if (!id || usedMarkerIds.has(id) || !Number.isFinite(Number(m?.yaw)) || !Number.isFinite(Number(m?.pitch))) {
+        return [];
+      }
+      usedMarkerIds.add(id);
+      const title = String(m.title || 'Information').trim() || 'Information';
+      const description = String(m.description || '').trim();
+      const image = String(m.image || '').trim();
+      const link = normalizeExternalUrl(m.link);
+      const content = [
+        '<div style="max-width:420px;line-height:1.5">',
+        image ? `<img src="${escapeHtml(image)}" alt="" style="display:block;width:100%;max-height:240px;object-fit:cover;border-radius:8px;margin-bottom:12px">` : '',
+        `<h2 style="font-size:18px;margin:0 0 8px">${escapeHtml(title)}</h2>`,
+        description ? `<p style="white-space:pre-wrap;margin:0 0 12px">${escapeHtml(description)}</p>` : '',
+        link ? `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);font-weight:700">Open link</a>` : '',
+        '</div>',
+      ].join('');
+      return {
+        id, type: 'image',
+        image: m.iconData || FALLBACK_INFO_ICON,
+        width: 30, height: 30,
+        position: { yaw: normalizeYaw(Number(m.yaw)), pitch: clampPitch(Number(m.pitch)) },
+        tooltip: { content: escapeHtml(title), position: 'top center' },
+        content,
+        listContent: escapeHtml(title),
+        data: { infoMarker: true },
+      } as any;
+    });
 
     return [...navMarkers, ...infoMarkers];
+  }
+
+  function replaceSceneMarkers(scene?: ProjectScene | null) {
+    try {
+      markersPlugin.setMarkers(scene ? buildSceneMarkers(scene) : []);
+      if (stereoPlugin?.isEnabled?.() || navigationVrDesired === true) {
+        markersPlugin.hideAllMarkers?.();
+      }
+    } catch { }
+  }
+
+  function syncGallerySelection(sceneId: string) {
+    if (!galleryPlugin) return;
+    try {
+      galleryPlugin.currentId = sceneId || undefined;
+      galleryPlugin.gallery?.setActive?.(sceneId || undefined);
+    } catch { }
   }
 
   // Match the preview: set markers on panorama-loaded + single RAF
@@ -339,14 +553,15 @@ async function boot() {
     const scene = getSceneById(currentSceneId);
     if (!scene) return;
     requestAnimationFrame(() => {
-      try { markersPlugin.setMarkers(buildSceneMarkers(scene)); } catch { }
+      if (navigationInProgress || currentSceneId !== scene.id) return;
+      replaceSceneMarkers(scene);
     });
   });
 
   function renderSceneList() {
     if (!sceneList) return;
     sceneList.innerHTML = '';
-    const scenes = project.scenes || [];
+    const scenes = getNavigableScenes();
     const currentIndex = scenes.findIndex((s) => s.id === currentSceneId);
     if (sceneCountEl) sceneCountEl.textContent = String(scenes.length);
     if (prevSceneBtn) prevSceneBtn.disabled = currentIndex <= 0;
@@ -373,7 +588,7 @@ async function boot() {
     image.src = project.floorPlanImage;
     image.alt = 'Floor plan';
     wrapper.appendChild(image);
-    (project.scenes || []).forEach((scene) => {
+    getNavigableScenes().forEach((scene) => {
       if (!scene.floorPlan) return;
       const pin = document.createElement('button');
       pin.type = 'button';
@@ -393,6 +608,9 @@ async function boot() {
   }
 
   function applyControlLabels() {
+    vrEnabled = stereoPlugin
+      ? navigationVrDesired ?? !!stereoPlugin.isEnabled?.()
+      : !!document.fullscreenElement;
     if (fullscreenBtn) fullscreenBtn.textContent = document.fullscreenElement ? 'Exit Fullscreen' : 'Fullscreen';
     if (fullscreenFab) {
       fullscreenFab.setAttribute('aria-label', document.fullscreenElement ? 'Exit fullscreen' : 'Fullscreen');
@@ -410,10 +628,26 @@ async function boot() {
   }
 
   function setAutorotate(enabled: boolean) {
+    if (enabled && (navigationInProgress || vrChangeInProgress)) return;
     autorotateEnabled = !!enabled && !!autorotatePlugin;
     try {
-      if (autorotateEnabled) autorotatePlugin?.start?.();
-      else autorotatePlugin?.stop?.();
+      if (autorotateEnabled) {
+        stopInertia();
+        if (stereoPlugin?.isEnabled?.()) {
+          void startVrChange(false).then((vrStillEnabled) => {
+            if (autorotateEnabled && !navigationInProgress && !stereoPlugin?.isEnabled?.()) {
+              autorotatePlugin?.start?.();
+            } else if (vrStillEnabled) {
+              autorotateEnabled = false;
+              applyControlLabels();
+            }
+          });
+        } else if (!navigationInProgress) {
+          autorotatePlugin?.start?.();
+        }
+      } else {
+        autorotatePlugin?.stop?.();
+      }
     } catch { }
     applyControlLabels();
   }
@@ -439,36 +673,152 @@ async function boot() {
   function setHotspotsVisible(visible: boolean) {
     hotspotsVisible = visible !== false;
     applyControlLabels();
+    if (navigationInProgress) return;
     const active = getSceneById(currentSceneId);
-    if (active) {
-      try { markersPlugin.setMarkers(buildSceneMarkers(active)); } catch { }
+    if (active) replaceSceneMarkers(active);
+  }
+
+  async function applyVrMode(enabled: boolean, operationId: number) {
+    if (!stereoPlugin) {
+      vrEnabled = false;
+      applyControlLabels();
+      return false;
     }
+    stopInertia();
+    setNavigationControlsEnabled(false);
+    try {
+      if (enabled) {
+        setAutorotate(false);
+        if (!stereoPlugin.isEnabled?.()) await stereoPlugin.start?.();
+      } else if (stereoPlugin.isEnabled?.()) {
+        stereoPlugin.stop?.();
+      }
+    } catch { }
+    const actual = !!stereoPlugin.isEnabled?.();
+    if (operationId === vrOperationId) {
+      vrEnabled = actual;
+      if (!actual && !navigationInProgress) {
+        replaceSceneMarkers(getSceneById(currentSceneId));
+      }
+      setNavigationControlsEnabled(!navigationInProgress);
+      applyControlLabels();
+    }
+    return actual;
+  }
+
+  function startVrChange(enabled: boolean) {
+    if (vrChangePromise) return vrChangePromise;
+    const operationId = ++vrOperationId;
+    vrChangeInProgress = true;
+    const operation = applyVrMode(enabled, operationId).finally(() => {
+      if (operationId !== vrOperationId || vrChangePromise !== operation) return;
+      vrChangeInProgress = false;
+      vrChangePromise = null;
+      vrEnabled = !!stereoPlugin?.isEnabled?.();
+      if (!vrEnabled && !navigationInProgress) {
+        replaceSceneMarkers(getSceneById(currentSceneId));
+      }
+      setNavigationControlsEnabled(!navigationInProgress);
+      applyControlLabels();
+    });
+    vrChangePromise = operation;
+    return operation;
   }
 
   async function toggleVr() {
-    if (stereoPlugin?.toggle) {
-      try { await stereoPlugin.toggle(); } catch { }
-      vrEnabled = !!stereoPlugin?.isEnabled?.();
-      applyControlLabels();
+    if (navigationInProgress || vrChangePromise || navigationVrDesired !== null) return;
+    if (!stereoPlugin) {
+      await toggleFullscreen();
       return;
     }
-    await toggleFullscreen();
+    await startVrChange(!stereoPlugin.isEnabled?.());
   }
 
-  async function updateScene(sceneId: string, options?: {
-    skipTransition?: boolean;
-    skipIntro?: boolean;
-    entryYaw?: number;
-    entryPitch?: number;
-  }) {
-    if (navigationInProgress && sceneId !== currentSceneId) return;
+  async function finishNavigationVrChain() {
+    const desired = navigationVrDesired;
+    if (desired === null || pendingNavigation) return;
+    if (stereoPlugin) {
+      if (desired && !stereoPlugin.isEnabled?.()) {
+        try { await startVrChange(true); } catch { }
+      } else if (!desired && stereoPlugin.isEnabled?.()) {
+        try { stereoPlugin.stop?.(); } catch { }
+      }
+    }
+
+    // A newer destination can arrive while StereoPlugin is starting. Keep the
+    // chain open and immediately leave that transient stereo session so the
+    // queued panorama can load before VR is restored for good.
+    if (pendingNavigation) {
+      if (desired && stereoPlugin?.isEnabled?.()) {
+        try { stereoPlugin.stop?.(); } catch { }
+      }
+      return;
+    }
+
+    navigationVrDesired = null;
+    vrEnabled = !!stereoPlugin?.isEnabled?.();
+  }
+
+  async function performSceneNavigation(sceneId: string, options: SceneNavigationOptions, signal: AbortSignal) {
+    if (vrChangePromise) {
+      try { await vrChangePromise; } catch { }
+    }
+    if (signal.aborted) return false;
     const scene = getSceneById(sceneId);
-    if (!scene) return;
-    navigationInProgress = true;
-    stopInertia();
-    try { markersPlugin.setMarkers([]); } catch { }
+    if (!scene || !scene.image) {
+      await finishNavigationVrChain();
+      return false;
+    }
+    if (navigationVrDesired === null) {
+      navigationVrDesired = !!stereoPlugin?.isEnabled?.();
+    }
+    if (!options.forceReload && sceneId === currentSceneId) {
+      syncGallerySelection(currentSceneId);
+      await finishNavigationVrChain();
+      return true;
+    }
+    const shouldRestoreVr = navigationVrDesired === true;
     const prevSceneId = currentSceneId;
-    currentSceneId = scene.id; // Set before setPanorama — matches preview pattern
+    const previousScene = getSceneById(prevSceneId);
+    const previousViewerMetadata = {
+      panorama: viewer.config?.panorama ?? previousScene?.image,
+      caption: viewer.config?.caption ?? previousScene?.name ?? null,
+      description: viewer.config?.description,
+      sphereCorrection: viewer.config?.sphereCorrection,
+    };
+    navigationInProgress = true;
+    // Show the loading overlay only if the panorama is not near-instant.
+    let loaderTimer: ReturnType<typeof setTimeout> | null = null;
+    if (!options.initialLoad && !options.forceLoadingOverlay) {
+      loaderTimer = setTimeout(() => {
+        loaderTimer = null;
+        setLoadingOverlay(`Loading ${scene.name || 'scene'}...`, true);
+      }, 300);
+    }
+    setNavigationControlsEnabled(false);
+    try { autorotatePlugin?.stop?.(); } catch { }
+    stopViewerMotion(!shouldRestoreVr);
+    applyControlLabels();
+    replaceSceneMarkers(null);
+    if (options.forceLoadingOverlay || loadingOverlay.dataset.state === 'error') {
+      setLoadingOverlay(`Loading ${scene.name || 'scene'}...`, true);
+    } else if (options.initialLoad) {
+      setLoadingOverlay(`Loading ${scene.name || 'scene'}...`);
+    }
+    const restorePreviousScene = () => {
+      currentSceneId = prevSceneId;
+      try { viewer.hideError?.(); } catch { }
+      try { viewer.loader?.hide?.(); } catch { }
+      try {
+        if (viewer.config) Object.assign(viewer.config, previousViewerMetadata);
+        if (viewer.state) viewer.state.loadingPromise = null;
+        viewer.navbar?.setCaption?.(previousViewerMetadata.caption);
+      } catch { }
+      syncGallerySelection(prevSceneId);
+      renderSceneList();
+      renderFloorPlan();
+    };
+    let loaded = false;
     try {
       const skipTransition = !!options?.skipTransition;
       const skipIntro = !!options?.skipIntro;
@@ -479,48 +829,135 @@ async function boot() {
       const targetPitch = hasEntry ? entryPitch : (scene.initialPitch || 0);
       const sceneZoom = Number.isFinite(Number(scene.initialZoom)) ? Number(scene.initialZoom) : 20;
 
-      if (isMobileLike) {
-        void preloadScenePanorama(sceneId);
-      } else {
-        await preloadScenePanorama(sceneId);
+      // Preloading is advisory. Adjacent scenes are usually warm already; when
+      // they are not, start warming without holding navigation hostage for the
+      // preload timeout before PSV gets its own chance to load the image.
+      void preloadScenePanorama(sceneId, signal).catch(() => {});
+      if (signal.aborted) {
+        restorePreviousScene();
+        return false;
       }
 
-      // Always use SHARED_VIEWER_TRANSITION — matches preview exactly
+      // Defaults to SHARED_VIEWER_TRANSITION — matches preview exactly
       const transitionOption = skipTransition
         ? false
-        : { speed: SHARED_VIEWER_TRANSITION.duration, effect: SHARED_VIEWER_TRANSITION.effect, rotation: false };
+        : {
+          // Honour the hotspot's own fade time (500-2000 ms, as in the editor).
+          speed: Number.isFinite(Number(options?.transitionDuration))
+            ? Math.max(500, Math.min(2000, Number(options.transitionDuration)))
+            : SHARED_VIEWER_TRANSITION.duration,
+          effect: SHARED_VIEWER_TRANSITION.effect,
+          rotation: false,
+        };
 
-      let loadOk = true;
-      try {
-        await viewer.setPanorama(scene.image, {
-          caption: scene.name,
-          position: { yaw: targetYaw, pitch: targetPitch },
-          defaultYaw: targetYaw,
-          defaultPitch: targetPitch,
-          transition: transitionOption,
-          zoom: sceneZoom,
-        });
-      } catch {
-        currentSceneId = prevSceneId; // Restore on error
-        loadOk = false;
-      }
+      const loadOk = await setPanoramaBounded(viewer, scene.image, {
+        caption: scene.name,
+        position: { yaw: targetYaw, pitch: targetPitch },
+        defaultYaw: targetYaw,
+        defaultPitch: targetPitch,
+        transition: transitionOption,
+        zoom: sceneZoom,
+      }, signal);
       // The panorama didn't switch — don't paint the failed scene's markers,
       // intro, or camera over the scene that's actually still showing.
-      if (!loadOk) return;
+      if (!loadOk) {
+        restorePreviousScene();
+        return false;
+      }
 
+      stopViewerMotion();
       try { viewer.rotate({ yaw: targetYaw, pitch: targetPitch }); } catch { }
-      viewer.zoom(sceneZoom);
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          try { markersPlugin.setMarkers(buildSceneMarkers(scene)); } catch { }
-        });
-      });
-      if (!skipIntro) showIntro(scene);
+      try { viewer.zoom(sceneZoom); } catch { }
+      currentSceneId = scene.id;
+      loaded = true;
+      syncGallerySelection(scene.id);
+      const hasDifferentPendingScene = !!pendingNavigation && pendingNavigation.sceneId !== scene.id;
+      if (!skipIntro && !hasDifferentPendingScene) showIntro(scene);
       renderSceneList();
       renderFloorPlan();
+      if (!hasDifferentPendingScene) hideLoadingOverlay();
+      return true;
+    } catch (error) {
+      console.error(`[PanoraDesk 360] Scene "${sceneId}" failed to load:`, error);
+      restorePreviousScene();
+      return false;
     } finally {
+      if (loaderTimer) { clearTimeout(loaderTimer); loaderTimer = null; }
+      if (!pendingNavigation) await finishNavigationVrChain();
       navigationInProgress = false;
+      const displayedScene = getSceneById(currentSceneId);
+      replaceSceneMarkers(displayedScene);
+      try { markersPlugin.renderMarkers?.(); } catch { }
+      setNavigationControlsEnabled(true);
+      if (autorotateEnabled && !stereoPlugin?.isEnabled?.()) setAutorotate(true);
+      applyControlLabels();
+      if (!loaded && !pendingNavigation && !signal.aborted) {
+        showSceneLoadError(
+          scene,
+          () => {
+            setLoadingOverlay(`Loading ${scene.name || 'scene'}...`, true);
+            void updateScene(scene.id, { ...options, forceReload: true, forceLoadingOverlay: true });
+          },
+          !!previousScene,
+        );
+      }
     }
+  }
+
+  function startNavigationWorker() {
+    if (navigationWorkerPromise) return;
+    navigationWorkerPromise = (async () => {
+      while (pendingNavigation) {
+        const request = pendingNavigation;
+        pendingNavigation = null;
+        activeNavigation = request;
+        const navigationAbort = new AbortController();
+        activeNavigationAbort = navigationAbort;
+        let loaded = false;
+        try {
+          loaded = await performSceneNavigation(request.sceneId, request.options, navigationAbort.signal);
+        } catch (error) {
+          console.error('[PanoraDesk 360] Unexpected navigation failure:', error);
+        } finally {
+          request.resolve(loaded);
+          if (activeNavigation === request) activeNavigation = null;
+          if (activeNavigationAbort === navigationAbort) activeNavigationAbort = null;
+        }
+      }
+    })().finally(() => {
+      navigationWorkerPromise = null;
+      if (pendingNavigation) startNavigationWorker();
+    });
+  }
+
+  function updateScene(sceneId: string, options: SceneNavigationOptions = {}) {
+    if (!getSceneById(sceneId)) return Promise.resolve(false);
+    if (
+      activeNavigation?.sceneId === sceneId
+      && !options.forceReload
+      && !activeNavigationAbort?.signal.aborted
+    ) {
+      // The newest request agrees with the scene already loading. Drop any
+      // older queued detour and let this transition finish uninterrupted.
+      if (pendingNavigation) pendingNavigation.resolve(false);
+      pendingNavigation = null;
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      if (pendingNavigation) pendingNavigation.resolve(false);
+      pendingNavigation = {
+        id: ++navigationRequestId,
+        sceneId,
+        options,
+        resolve,
+      };
+      // A different latest destination supersedes the active texture request;
+      // the worker will start the queued scene as soon as abort cleanup ends.
+      if (activeNavigation && activeNavigation.sceneId !== sceneId) {
+        activeNavigationAbort?.abort();
+      }
+      startNavigationWorker();
+    });
   }
 
   markersPlugin.addEventListener('select-marker', ({ marker }: any) => {
@@ -565,11 +1002,25 @@ async function boot() {
       }
     }
     const entry = finalEntry || fallbackEntry;
-    void updateScene(targetSceneId, { entryYaw: entry.yaw, entryPitch: entry.pitch });
+    const hotspotFade = Number(marker?.data?.transitionDuration);
+    void updateScene(targetSceneId, {
+      entryYaw: entry.yaw,
+      entryPitch: entry.pitch,
+      transitionDuration: Number.isFinite(hotspotFade) ? hotspotFade : undefined,
+    });
   });
 
   stereoPlugin?.addEventListener?.('stereo-updated', (event: any) => {
-    vrEnabled = !!event?.stereoEnabled;
+    vrEnabled = navigationVrDesired ?? !!event?.stereoEnabled;
+    if (!vrEnabled && !navigationInProgress) {
+      replaceSceneMarkers(getSceneById(currentSceneId));
+    }
+    if (!navigationInProgress && !vrChangeInProgress) setNavigationControlsEnabled(true);
+    applyControlLabels();
+  });
+  autorotatePlugin?.addEventListener?.('autorotate', (event: any) => {
+    const active = !!event?.autorotateEnabled;
+    if (!navigationInProgress || active) autorotateEnabled = active;
     applyControlLabels();
   });
 
@@ -595,16 +1046,26 @@ async function boot() {
   galleryBtn?.addEventListener('click', () => { setGalleryVisible(!galleryVisible); closeMenu(); });
   vrBtn?.addEventListener('click', () => { void toggleVr(); });
   prevSceneBtn?.addEventListener('click', () => {
-    const scenes = project.scenes || [];
-    const idx = scenes.findIndex((s) => s.id === currentSceneId);
+    const scenes = getNavigableScenes();
+    const requestedSceneId = pendingNavigation?.sceneId || activeNavigation?.sceneId || currentSceneId;
+    const idx = scenes.findIndex((s) => s.id === requestedSceneId);
     if (idx > 0) { void updateScene(scenes[idx - 1].id); closeMenu(); }
   });
   nextSceneBtn?.addEventListener('click', () => {
-    const scenes = project.scenes || [];
-    const idx = scenes.findIndex((s) => s.id === currentSceneId);
+    const scenes = getNavigableScenes();
+    const requestedSceneId = pendingNavigation?.sceneId || activeNavigation?.sceneId || currentSceneId;
+    const idx = scenes.findIndex((s) => s.id === requestedSceneId);
     if (idx >= 0 && idx < scenes.length - 1) { void updateScene(scenes[idx + 1].id); closeMenu(); }
   });
-  document.addEventListener('fullscreenchange', applyControlLabels);
+  document.addEventListener('fullscreenchange', () => {
+    window.setTimeout(() => {
+      applyControlLabels();
+      if (!stereoPlugin?.isEnabled?.() && !navigationInProgress) {
+        replaceSceneMarkers(getSceneById(currentSceneId));
+        setNavigationControlsEnabled(true);
+      }
+    }, 0);
+  });
 
   const disableControl = (btn: HTMLButtonElement | null) => {
     if (!btn) return;
@@ -642,8 +1103,14 @@ async function boot() {
   applyControlLabels();
   renderSceneList();
   renderFloorPlan();
-  // panorama-loaded listener handles initial markers — no updateScene call needed for first scene
-  setTimeout(() => { loadingOverlay.style.display = 'none'; }, project.exportSettings?.showLoadingScreen ? 900 : 0);
+  if (!first?.id || !first.image) {
+    throw new Error('This tour does not contain a loadable scene.');
+  }
+  await updateScene(first.id, {
+    skipTransition: true,
+    initialLoad: true,
+    forceReload: true,
+  });
 }
 
 // Any failure before the tail of boot() used to leave the loading overlay up
@@ -654,10 +1121,25 @@ boot().catch((err) => {
   const overlay = document.getElementById('loadingOverlay');
   if (!overlay) return;
   overlay.style.display = 'flex';
-  overlay.innerHTML = '<div class="box">'
-    + '<div style="font-size:15px;font-weight:600;margin-bottom:8px">This tour could not be loaded</div>'
-    + '<div style="font-size:12px;opacity:.75;max-width:420px;line-height:1.5">'
-    + 'The tour data is missing or unreadable. If you opened index.html directly from disk, '
-    + 'serve the folder over HTTP instead — browsers block local file access.'
-    + '</div></div>';
+  overlay.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'box';
+  const title = document.createElement('div');
+  title.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:8px';
+  title.textContent = 'This tour could not be loaded';
+  const description = document.createElement('div');
+  description.style.cssText = 'font-size:12px;opacity:.75;max-width:420px;line-height:1.5;margin-bottom:14px';
+  description.textContent = err instanceof Error && err.message
+    ? err.message
+    : 'The tour data is missing or unreadable.';
+  const hint = document.createElement('div');
+  hint.style.cssText = 'font-size:11px;opacity:.6;max-width:420px;line-height:1.5;margin-bottom:14px';
+  hint.textContent = 'If index.html was opened directly from disk, serve the exported folder over HTTP instead.';
+  const retryButton = document.createElement('button');
+  retryButton.type = 'button';
+  retryButton.textContent = 'Retry';
+  retryButton.style.cssText = 'border:0;border-radius:8px;padding:8px 14px;cursor:pointer;background:var(--accent);color:#111;font-weight:700';
+  retryButton.addEventListener('click', () => window.location.reload(), { once: true });
+  box.append(title, description, hint, retryButton);
+  overlay.appendChild(box);
 });

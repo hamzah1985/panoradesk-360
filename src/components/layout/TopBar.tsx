@@ -7,16 +7,28 @@ import { useUiStore } from '../../store/uiStore';
 import KeyboardShortcutsModal from '../modals/KeyboardShortcutsModal';
 import CommandPaletteModal from '../modals/CommandPaletteModal';
 import appLogo from '../../assets/app-logo.svg';
+import { hasEscapeCloseLayer } from '../../hooks/useEscapeClose';
 
 const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSettings: () => void; onToggleFocus: () => void; isFocusMode: boolean }) => {
-  const { project, setMode, saveProject, setProject, saveState, lastSavedAt, setCurrentScene, undo, redo, duplicateScene, deleteScene, currentSceneId } = useProjectStore();
+  const { project, setMode, saveProject, flushProject, setProject, saveState, lastSavedAt, setCurrentScene, undo, redo, duplicateScene, deleteScene, currentSceneId } = useProjectStore();
   const canUndoValue = useProjectStore((s) => s.canUndo());
   const canRedoValue = useProjectStore((s) => s.canRedo());
   const { openConfirm, pushToast } = useUiStore();
   const [isExportOpen, setIsExportOpen] = React.useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = React.useState(false);
   const [isCommandOpen, setIsCommandOpen] = React.useState(false);
+  const [isOpeningPreview, setIsOpeningPreview] = React.useState(false);
+  const mountedRef = React.useRef(true);
+  const modeRequestRef = React.useRef(0);
   const sceneCount = project?.scenes?.length || 0;
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      modeRequestRef.current += 1;
+    };
+  }, []);
 
   const [relativeTime, setRelativeTime] = React.useState('');
   React.useEffect(() => {
@@ -33,21 +45,59 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
     return () => clearInterval(timer);
   }, [lastSavedAt]);
 
-  const scenesRef = React.useRef(project?.scenes || []);
-  React.useEffect(() => { scenesRef.current = project?.scenes || []; }, [project?.scenes]);
-
   const currentSceneIndex = React.useMemo(
     () => project?.scenes.findIndex((s) => s.id === currentSceneId) ?? -1,
     [project?.scenes, currentSceneId],
   );
 
-  const handleBackToDashboard = React.useCallback(() => {
-    if (saveState === 'saving') {
-      pushToast('info', 'Please wait for saving to finish before leaving the editor.');
+  const handleBackToDashboard = React.useCallback(async () => {
+    const requestId = ++modeRequestRef.current;
+    setIsOpeningPreview(false);
+    // Do not expose a stale dashboard copy while the final editor snapshot is
+    // still queued. Reopening and editing that copy could otherwise overwrite
+    // the flush that was meant to protect the latest changes.
+    try {
+      await flushProject();
+      if (!mountedRef.current || modeRequestRef.current !== requestId) return;
+      // Dashboard actions must never retain a hidden active editor project. In
+      // particular, deleting that recent project would otherwise leave close
+      // trying forever to flush a deliberately tombstoned ID.
+      setProject(null);
+    } catch {
+      // Stay in the editor so the user can retry instead of losing changes.
+      if (mountedRef.current) pushToast('error', 'Could not save the project, so it was not closed. Retry the save first.');
+    }
+  }, [flushProject, setProject, pushToast]);
+
+  const handleOpenPreview = React.useCallback(async () => {
+    const liveProject = useProjectStore.getState().project;
+    if (!liveProject?.scenes.length) {
+      pushToast('info', 'Add at least one scene before opening preview.');
       return;
     }
-    setMode(AppMode.DASHBOARD);
-  }, [saveState, pushToast, setMode]);
+    if (isOpeningPreview) return;
+    const requestId = ++modeRequestRef.current;
+    setIsOpeningPreview(true);
+    try {
+      // Project operations include scene imports and asset uploads. Keep the
+      // editor mounted until their results have reached the store and the final
+      // stable snapshot is saved, then preview that exact snapshot.
+      await flushProject();
+      if (!mountedRef.current || modeRequestRef.current !== requestId) return;
+      setIsOpeningPreview(false);
+      setMode(AppMode.PREVIEW);
+    } catch {
+      if (!mountedRef.current || modeRequestRef.current !== requestId) return;
+      setIsOpeningPreview(false);
+      pushToast('error', 'Unable to open preview until pending project changes finish saving.');
+    }
+  }, [flushProject, isOpeningPreview, pushToast, setMode]);
+
+  React.useEffect(() => {
+    const onPreviewRequest = () => { void handleOpenPreview(); };
+    window.addEventListener('request-preview', onPreviewRequest);
+    return () => window.removeEventListener('request-preview', onPreviewRequest);
+  }, [handleOpenPreview]);
 
   const handleDeleteCurrentProject = React.useCallback(async () => {
     if (!project?.id) return;
@@ -73,6 +123,8 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
 
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (useUiStore.getState().confirm.open) return;
+      if (hasEscapeCloseLayer()) return;
       const active = document.activeElement as HTMLElement | null;
       const tag = (active?.tagName || '').toUpperCase();
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;
@@ -89,14 +141,13 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
 
   const commandItems = React.useMemo(() => {
     const items: Array<{ id: string; label: string; hint?: string; run: () => void }> = [
-      { id: 'save', label: 'Save Project', hint: 'Ctrl/Cmd+S', run: () => { void saveProject(); } },
+      { id: 'save', label: 'Save Project', hint: 'Ctrl/Cmd+S', run: () => { void saveProject().catch(() => {}); } },
       {
         id: 'preview',
         label: 'Open Preview',
         hint: 'P',
         run: () => {
-          if (!sceneCount) { pushToast('info', 'Add at least one scene before opening preview.'); return; }
-          setMode(AppMode.PREVIEW);
+          void handleOpenPreview();
         },
       },
       {
@@ -107,7 +158,7 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
           setIsExportOpen(true);
         },
       },
-      { id: 'dashboard', label: 'Back To Dashboard', run: () => handleBackToDashboard() },
+      { id: 'dashboard', label: 'Back To Dashboard', run: () => { void handleBackToDashboard(); } },
       { id: 'delete-project', label: 'Delete Current Project', run: () => { void handleDeleteCurrentProject(); } },
       { id: 'settings', label: 'Open Project Settings', run: () => onToggleSettings() },
       { id: 'shortcuts', label: 'Open Keyboard Shortcuts', hint: '?', run: () => setIsShortcutsOpen(true) },
@@ -120,7 +171,7 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
       { id: 'capture-view', label: 'Save Current View', run: () => window.dispatchEvent(new CustomEvent('capture-view')) },
       { id: 'reset-view', label: 'Reset Scene View', run: () => window.dispatchEvent(new CustomEvent('reset-view')) },
     ];
-    const sceneList = scenesRef.current;
+    const sceneList = project?.scenes || [];
     const currentIndex = sceneList.findIndex((s) => s.id === currentSceneId);
     if (currentIndex >= 0) {
       if (currentIndex > 0) items.push({ id: 'scene-prev', label: 'Go to Previous Scene', hint: 'Alt+Left', run: () => setCurrentScene(sceneList[currentIndex - 1].id) });
@@ -143,7 +194,7 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
       items.push({ id: `scene-${scene.id}`, label: `Go to Scene: ${scene.name}`, hint: `Scene ${index + 1}`, run: () => setCurrentScene(scene.id) });
     });
     return items;
-  }, [saveProject, sceneCount, pushToast, setMode, onToggleSettings, isFocusMode, onToggleFocus, setCurrentScene, currentSceneId, duplicateScene, deleteScene, openConfirm, handleBackToDashboard, handleDeleteCurrentProject]);
+  }, [saveProject, sceneCount, project?.scenes, pushToast, onToggleSettings, isFocusMode, onToggleFocus, setCurrentScene, currentSceneId, duplicateScene, deleteScene, openConfirm, handleBackToDashboard, handleDeleteCurrentProject, handleOpenPreview]);
 
   const saveLabel = saveState === 'saving'
     ? 'Saving…'
@@ -177,7 +228,7 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
         {/* Left cluster: back · logo · name · scene position · save state · ⌘K hint */}
         <div className="flex items-center gap-3 min-w-0">
           <button
-            onClick={handleBackToDashboard}
+            onClick={() => { void handleBackToDashboard(); }}
             className="p-1.5 hover:bg-slate-800 rounded-lg transition-colors text-slate-400 hover:text-white flex-shrink-0"
             title="Back to dashboard"
           >
@@ -210,7 +261,7 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
             )}
             {saveState === 'error' && (
               <button
-                onClick={() => { void saveProject(); }}
+                onClick={() => { void saveProject().catch(() => {}); }}
                 title="Retry save"
                 className="p-0.5 rounded text-red-400 hover:text-red-300 hover:bg-slate-800 transition-colors"
               >
@@ -249,7 +300,7 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
 
           <button
             disabled={!project || saveState === 'saving'}
-            onClick={() => saveProject()}
+            onClick={() => { void saveProject().catch(() => {}); }}
             title="Save (Ctrl/Cmd+S)"
             className="flex items-center gap-1.5 px-2.5 py-1.5 text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-white rounded-lg transition-colors disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-slate-400"
           >
@@ -260,12 +311,12 @@ const TopBar = ({ onToggleSettings, onToggleFocus, isFocusMode }: { onToggleSett
           <div className="w-px h-5 bg-slate-700 mx-1" />
 
           <button
-            disabled={sceneCount === 0}
-            onClick={() => setMode(AppMode.PREVIEW)}
-            title={sceneCount === 0 ? 'Add at least one scene to preview' : 'Preview (P)'}
+            disabled={sceneCount === 0 || isOpeningPreview}
+            onClick={() => { void handleOpenPreview(); }}
+            title={sceneCount === 0 ? 'Add at least one scene to preview' : isOpeningPreview ? 'Finishing pending project changes…' : 'Preview (P)'}
             className="flex items-center gap-1.5 px-2.5 py-1.5 text-sm font-medium text-slate-400 hover:bg-slate-800 hover:text-white rounded-lg transition-colors disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-slate-400"
           >
-            <Play className="w-4 h-4" />
+            {isOpeningPreview ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
             <span className="hidden lg:inline">Preview</span>
           </button>
 

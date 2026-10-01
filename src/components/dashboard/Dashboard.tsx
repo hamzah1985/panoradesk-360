@@ -6,6 +6,7 @@ import { useEscapeClose } from '../../hooks/useEscapeClose';
 import { resolveAssetSrc } from '../../lib/media';
 import appLogo from '../../assets/app-logo.svg';
 import { getDesktopApi } from '../../lib/desktop';
+import { BUILD_NUMBER } from '../../lib/buildInfo';
 
 const LAST_PROJECT_PARENT_DIR_KEY = 'panoradesk_parent_project_dir';
 
@@ -32,9 +33,15 @@ function makeUniqueProjectName(baseName: string, existingNames: string[]) {
       .map((name) => String(name || '').trim().toLowerCase())
       .filter(Boolean),
   );
-  if (!existing.has(base.toLowerCase())) return base;
+  const existingFolders = new Set(
+    (existingNames || []).map((name) => sanitizeFolderName(String(name || '')).toLowerCase()),
+  );
+  if (!existing.has(base.toLowerCase()) && !existingFolders.has(sanitizeFolderName(base).toLowerCase())) return base;
   let idx = 2;
-  while (existing.has(`${base} (${idx})`.toLowerCase())) idx += 1;
+  while (
+    existing.has(`${base} (${idx})`.toLowerCase())
+    || existingFolders.has(sanitizeFolderName(`${base} (${idx})`).toLowerCase())
+  ) idx += 1;
   return `${base} (${idx})`;
 }
 
@@ -49,6 +56,15 @@ function relativeTime(date: string | undefined) {
   const days = Math.floor(hrs / 24);
   if (days < 7) return `${days}d ago`;
   return new Date(date).toLocaleDateString();
+}
+
+function projectOpenFailureMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  const safeFailure = 'This project cannot be opened safely';
+  const safeFailureIndex = message.indexOf(safeFailure);
+  return safeFailureIndex >= 0
+    ? message.slice(safeFailureIndex)
+    : 'Failed to open project file';
 }
 
 const SphereBg = () => (
@@ -78,6 +94,7 @@ const Dashboard = () => {
   const [projectFolder, setProjectFolder] = React.useState('');
   const [deletingId, setDeletingId] = React.useState<string | null>(null);
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
+  const [renamingPath, setRenamingPath] = React.useState<string | undefined>(undefined);
   const [renamingValue, setRenamingValue] = React.useState('');
   const renameInputRef = React.useRef<HTMLInputElement>(null);
   const [recentQuery, setRecentQuery] = React.useState('');
@@ -86,8 +103,15 @@ const Dashboard = () => {
   const [activeRecentId, setActiveRecentId] = React.useState('');
   const [isDragOver, setIsDragOver] = React.useState(false);
   const mountedRef = React.useRef(true);
+  const projectOpenSequenceRef = React.useRef(0);
 
-  React.useEffect(() => { return () => { mountedRef.current = false; }; }, []);
+  React.useEffect(() => {
+    // React StrictMode intentionally runs an effect setup/cleanup/setup cycle
+    // in development. Re-arm the guard during setup so the real mount can
+    // still accept the async project-list result.
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const loadRecentProjects = React.useCallback(async () => {
     setIsRecentLoading(true);
@@ -109,6 +133,7 @@ const Dashboard = () => {
   useEscapeClose(isNewModalOpen, () => setIsNewModalOpen(false));
 
   const handleNewProject = React.useCallback(() => {
+    projectOpenSequenceRef.current += 1;
     setProjectName('New 360 Tour');
     setProjectFolder(localStorage.getItem(LAST_PROJECT_PARENT_DIR_KEY) || '');
     setIsNewModalOpen(true);
@@ -135,6 +160,7 @@ const Dashboard = () => {
     const parentDir = projectFolder.trim();
     if (parentDir) localStorage.setItem(LAST_PROJECT_PARENT_DIR_KEY, parentDir);
     const projectDir = parentDir ? joinPath(parentDir, sanitizeFolderName(uniqueName)) : undefined;
+    projectOpenSequenceRef.current += 1;
     createNewProject(uniqueName, projectDir);
     if (uniqueName !== cleanName) {
       pushToast('info', `Project name already exists. Created as "${uniqueName}"`);
@@ -152,9 +178,25 @@ const Dashboard = () => {
   }, [recentProjects, recentQuery]);
 
   const handleOpenProject = React.useCallback(async () => {
-    const project = await openProjectFromDialog();
-    if (project) setProject(project);
-  }, [setProject]);
+    const sequence = ++projectOpenSequenceRef.current;
+    try {
+      const project = await openProjectFromDialog();
+      if (project && mountedRef.current && projectOpenSequenceRef.current === sequence) setProject(project);
+    } catch (error) {
+      if (mountedRef.current && projectOpenSequenceRef.current === sequence) {
+        pushToast('error', projectOpenFailureMessage(error));
+      }
+    }
+  }, [setProject, pushToast]);
+
+  const openRecentProject = React.useCallback((nextProject: any) => {
+    projectOpenSequenceRef.current += 1;
+    try {
+      setProject(nextProject);
+    } catch (error) {
+      pushToast('error', projectOpenFailureMessage(error));
+    }
+  }, [setProject, pushToast]);
 
   React.useEffect(() => {
     if (!filteredRecent.length) { setActiveRecentId(''); return; }
@@ -175,6 +217,7 @@ const Dashboard = () => {
         try {
           const deleted = await deleteProject(projectId, projectPath);
           if (!deleted) { pushToast('error', 'Failed to delete project from disk'); return; }
+          if (useProjectStore.getState().project?.id === projectId) setProject(null);
           await loadRecentProjects();
           pushToast('success', 'Project deleted');
         } catch {
@@ -184,52 +227,63 @@ const Dashboard = () => {
         }
       },
     });
-  }, [openConfirm, loadRecentProjects, pushToast]);
+  }, [openConfirm, loadRecentProjects, pushToast, setProject]);
 
   const startRename = React.useCallback((proj: any) => {
     setRenamingId(proj.id);
+    setRenamingPath(proj.path);
     setRenamingValue(proj.name);
     setTimeout(() => renameInputRef.current?.select(), 0);
   }, []);
 
   const commitRename = React.useCallback(async () => {
-    if (!renamingId || !renamingValue.trim()) { setRenamingId(null); return; }
-    const ok = await renameProjectInList(renamingId, renamingValue.trim());
+    if (!renamingId || !renamingValue.trim()) { setRenamingId(null); setRenamingPath(undefined); return; }
+    const ok = await renameProjectInList(renamingId, renamingValue.trim(), renamingPath);
     if (!ok) pushToast('error', 'Failed to rename project');
     else {
       setRecentProjects((prev) => prev.map((p) => p.id === renamingId ? { ...p, name: renamingValue.trim() } : p));
     }
     setRenamingId(null);
-  }, [renamingId, renamingValue, pushToast]);
+    setRenamingPath(undefined);
+  }, [renamingId, renamingPath, renamingValue, pushToast]);
 
   const handleDrop = React.useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(false);
     const files = Array.from(e.dataTransfer.files) as File[];
-    const jsonFile = files.find((f) => f.name.endsWith('.json'));
+    const jsonFile = files.find((file) => file.name.toLowerCase() === 'project.json')
+      || files.find((file) => file.name.toLowerCase().endsWith('.json'));
     if (!jsonFile) return;
+    const sequence = ++projectOpenSequenceRef.current;
+    const desktop = getDesktopApi();
     try {
-      const text = await new Response(jsonFile).text();
-      const proj = JSON.parse(text);
-      const filePath = (jsonFile as any).path as string | undefined;
-      if (filePath) {
-        const pathSep = filePath.includes('\\') ? '\\' : '/';
-        const dir = filePath.split(pathSep).slice(0, -1).join(pathSep);
-        setProject({ ...proj, path: dir });
-      } else {
-        setProject(proj);
+      if (!desktop?.openProjectFile) throw new Error('Desktop project opening is unavailable.');
+      const filePath = desktop.getPathForFile?.(jsonFile)
+        || ((jsonFile as any).path as string | undefined);
+      if (!filePath) throw new Error('Unable to resolve the dropped project file.');
+      const project = await desktop.openProjectFile(filePath);
+      if (project && mountedRef.current && projectOpenSequenceRef.current === sequence) setProject(project);
+    } catch (error) {
+      if (mountedRef.current && projectOpenSequenceRef.current === sequence) {
+        const message = projectOpenFailureMessage(error);
+        pushToast(
+          'error',
+          message === 'Failed to open project file'
+            ? 'Failed to open project file — drop the project.json from a PanoraDesk project folder'
+            : message,
+        );
       }
-    } catch {
-      pushToast('error', 'Failed to open project file — make sure it is a valid PanoraDesk project');
     }
   }, [setProject, pushToast]);
 
   React.useEffect(() => {
     if (isNewModalOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (useUiStore.getState().confirm.open) return;
       const active = document.activeElement as HTMLElement | null;
       const tag = (active?.tagName || '').toUpperCase();
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;
+      if (active?.closest('button, a[href], [role="button"]')) return;
       const meta = e.ctrlKey || e.metaKey;
       if (meta && e.key.toLowerCase() === 'n') { e.preventDefault(); handleNewProject(); return; }
       if (meta && e.key.toLowerCase() === 'o') { e.preventDefault(); void handleOpenProject(); return; }
@@ -237,12 +291,12 @@ const Dashboard = () => {
       const idx = Math.max(0, filteredRecent.findIndex((p) => p.id === activeRecentId));
       if (e.key === 'ArrowDown') { e.preventDefault(); setActiveRecentId(filteredRecent[Math.min(filteredRecent.length - 1, idx + 1)].id); return; }
       if (e.key === 'ArrowUp') { e.preventDefault(); setActiveRecentId(filteredRecent[Math.max(0, idx - 1)].id); return; }
-      if (e.key === 'Enter') { const p = filteredRecent.find((p) => p.id === activeRecentId) || filteredRecent[0]; if (p) { e.preventDefault(); setProject(p); } return; }
+      if (e.key === 'Enter') { const p = filteredRecent.find((p) => p.id === activeRecentId) || filteredRecent[0]; if (p) { e.preventDefault(); openRecentProject(p); } return; }
       if (e.key === 'Delete' || e.key === 'Backspace') { const p = filteredRecent.find((p) => p.id === activeRecentId) || filteredRecent[0]; if (p) { e.preventDefault(); void handleDeleteProject(p.id, p.name, p.path); } }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isNewModalOpen, filteredRecent, activeRecentId, handleDeleteProject, handleNewProject, handleOpenProject, setProject]);
+  }, [isNewModalOpen, filteredRecent, activeRecentId, handleDeleteProject, handleNewProject, handleOpenProject, openRecentProject]);
 
   return (
     <div
@@ -355,7 +409,7 @@ const Dashboard = () => {
               {filteredRecent.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => { const p = filteredRecent[0]; if (p) setProject(p); }}
+                  onClick={() => { const p = filteredRecent[0]; if (p) openRecentProject(p); }}
                   className="flex items-center gap-1 text-[10px] font-semibold transition-colors"
                   style={{ color: '#C8A96A' }}
                 >
@@ -440,7 +494,7 @@ const Dashboard = () => {
                         <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity" style={{ background: 'rgba(0,0,0,0.45)' }}>
                           <button
                             type="button"
-                            onClick={() => setProject(proj)}
+                            onClick={() => openRecentProject(proj)}
                             className="px-3 py-1.5 rounded-lg text-xs font-bold text-white"
                             style={{ background: 'rgba(200,169,106,0.9)' }}
                           >
@@ -465,7 +519,10 @@ const Dashboard = () => {
                                 className="flex-1 bg-transparent border-b border-amber-400 text-[12px] font-semibold text-amber-200 outline-none px-0 py-0 min-w-0"
                                 value={renamingValue}
                                 onChange={(e) => setRenamingValue(e.target.value)}
-                                onKeyDown={(e) => { if (e.key === 'Enter') void commitRename(); if (e.key === 'Escape') setRenamingId(null); }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') void commitRename();
+                                  if (e.key === 'Escape') { setRenamingId(null); setRenamingPath(undefined); }
+                                }}
                                 onBlur={() => { void commitRename(); }}
                                 autoFocus
                               />
@@ -474,7 +531,7 @@ const Dashboard = () => {
                           ) : (
                             <button
                               type="button"
-                              onClick={() => setProject(proj)}
+                              onClick={() => openRecentProject(proj)}
                               onDoubleClick={(e) => { e.preventDefault(); startRename(proj); }}
                               className="text-left w-full"
                             >
@@ -528,7 +585,7 @@ const Dashboard = () => {
       {/* Footer */}
       <div className="relative z-10 py-3 text-center border-t flex-shrink-0" style={{ borderColor: 'rgba(255,255,255,0.06)' }}>
         <span className="text-[10px] font-semibold tracking-widest uppercase" style={{ color: 'rgba(255,255,255,0.18)' }}>
-          v1.1.2 · Professional Virtual Tour Editor
+          Build {BUILD_NUMBER} · Professional Virtual Tour Editor
         </span>
       </div>
 

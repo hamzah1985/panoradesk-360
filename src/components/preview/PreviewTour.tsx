@@ -26,7 +26,18 @@ const PreviewTour = () => {
 
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      const closeOverlayEvent = new Event('preview-close-top-overlay', { cancelable: true });
+      window.dispatchEvent(closeOverlayEvent);
+      if (closeOverlayEvent.defaultPrevented) {
+        e.preventDefault();
+        return;
+      }
+      if (document.fullscreenElement) {
+        e.preventDefault();
+        void document.exitFullscreen().catch(() => {});
+        return;
+      }
       e.preventDefault();
       setMode(AppMode.EDITOR);
     };

@@ -57,6 +57,8 @@ export interface DesktopApi {
   deleteProject: (projectId: string, projectPath?: string) => Promise<boolean>;
   saveProject: (project: Project) => Promise<Project>;
   openProjectDialog: () => Promise<Project | null>;
+  openProjectFile: (filePath: string) => Promise<Project | null>;
+  getPathForFile?: (file: File) => string;
   pickProjectDirectory: () => Promise<string | null>;
   importSceneImages: (project: Project) => Promise<SceneImportResult>;
   onSceneImportProgress: (callback: (progress: SceneImportProgress) => void) => () => void;
@@ -66,10 +68,12 @@ export interface DesktopApi {
   exportWebProject: (project: Project, options: ExportOptions) => Promise<ExportResult>;
   previewWebExport: (project: Project, options: ExportOptions) => Promise<{ url: string; exportDir: string }>;
   getInlinePreviewUrl: (project: Project, options: ExportOptions) => Promise<{ url: string }>;
+  releaseInlinePreview?: () => Promise<boolean>;
   openPathInFileManager: (targetPath: string) => Promise<boolean>;
   deleteFile: (projectPath: string, relPath: string) => Promise<boolean>;
-  onFlushBeforeClose?: (callback: () => void | Promise<void>) => () => void;
-  confirmClose?: () => Promise<boolean>;
+  onFlushBeforeClose?: (callback: (requestId: string) => void | Promise<void>) => () => void;
+  confirmClose?: (requestId: string) => Promise<boolean>;
+  cancelClose?: (requestId: string) => Promise<boolean>;
   getDeployPath: () => Promise<string | null>;
   deployToWebsite: (project: Project, options: ExportOptions) => Promise<{ canceled: boolean; exportDir?: string; tourId?: string; tourPath?: string; pageFile?: string; notes?: string }>;
   getMenuBarVisible: () => Promise<boolean>;

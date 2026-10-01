@@ -1,10 +1,10 @@
 import React from 'react';
-import { useProjectStore } from '../../store/projectStore';
+import { runProjectOperation, useProjectStore } from '../../store/projectStore';
 import { X, Upload, Map as MapIcon, Crosshair, Trash2, SkipForward, ImageMinus } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { getDesktopApi } from '../../lib/desktop';
 import { resolveAssetSrc } from '../../lib/media';
-import { useEscapeClose } from '../../hooks/useEscapeClose';
+import { getEscapeCloseLayerCount, useEscapeClose } from '../../hooks/useEscapeClose';
 import { useUiStore } from '../../store/uiStore';
 
 interface FloorPlanPanelProps {
@@ -12,7 +12,7 @@ interface FloorPlanPanelProps {
 }
 
 const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
-  const { project, updateProject, updateScene, currentSceneId, setCurrentScene } = useProjectStore();
+  const { project, updateScene, currentSceneId, setCurrentScene } = useProjectStore();
   const { pushToast, openConfirm } = useUiStore();
   const [isEditing, setIsEditing] = React.useState(false);
   const containerRef = React.useRef<HTMLDivElement>(null);
@@ -34,29 +34,57 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
 
   const handleMapUpload = async () => {
     if (!project) return;
+    const ownerProjectId = project.id;
     const desktop = getDesktopApi();
     if (desktop) {
-      try {
-        const result = await desktop.uploadFloorPlan(project);
-        if (!result) return;
-        updateProject({ floorPlanImage: result.path, path: result.projectPath });
-      } catch {
-        pushToast('error', 'Failed to upload floor plan');
-      }
+      const ownerProject = project;
+      await runProjectOperation(ownerProjectId, async () => {
+        try {
+          const result = await desktop.uploadFloorPlan(ownerProject);
+          if (!result) return;
+          const latest = useProjectStore.getState();
+          if (latest.project?.id !== ownerProjectId) return;
+          latest.updateProject({ floorPlanImage: result.path, path: result.projectPath });
+        } catch {
+          if (useProjectStore.getState().project?.id === ownerProjectId) {
+            pushToast('error', 'Failed to upload floor plan');
+          }
+        }
+      });
     } else {
       mapUploadInputRef.current?.click();
     }
   };
   const handleMapFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      updateProject({ floorPlanImage: reader.result as string });
-      pushToast('success', `Floor plan "${file.name}" uploaded`);
-    };
-    reader.onerror = () => pushToast('error', 'Failed to read floor plan image');
-    reader.readAsDataURL(file);
+    if (!file || !project) return;
+    const ownerProjectId = project.id;
+    void runProjectOperation(ownerProjectId, () => new Promise<void>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const latest = useProjectStore.getState();
+        if (latest.project?.id === ownerProjectId) {
+          latest.updateProject({ floorPlanImage: reader.result as string });
+          pushToast('success', `Floor plan "${file.name}" uploaded`);
+        }
+        resolve();
+      };
+      reader.onerror = () => {
+        if (useProjectStore.getState().project?.id === ownerProjectId) {
+          pushToast('error', 'Failed to read floor plan image');
+        }
+        resolve();
+      };
+      reader.onabort = () => resolve();
+      try {
+        reader.readAsDataURL(file);
+      } catch {
+        if (useProjectStore.getState().project?.id === ownerProjectId) {
+          pushToast('error', 'Failed to read floor plan image');
+        }
+        resolve();
+      }
+    }));
     e.target.value = '';
   };
 
@@ -68,6 +96,7 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
   };
   const clearAllScenePins = () => {
     if (!project || pinnedCount === 0) return;
+    const ownerProjectId = project.id;
     openConfirm({
       title: 'Clear All Floor Plan Pins',
       message: `Remove floor plan pins from ${pinnedCount} scene${pinnedCount === 1 ? '' : 's'}?`,
@@ -76,8 +105,8 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
       tone: 'danger',
       onConfirm: () => {
         const latest = useProjectStore.getState().project;
-        if (!latest) return;
-        updateProject({
+        if (!latest || latest.id !== ownerProjectId) return;
+        useProjectStore.getState().updateProject({
           scenes: latest.scenes.map((scene) => ({ ...scene, floorPlan: undefined })),
         });
         setIsEditing(false);
@@ -93,6 +122,7 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
   };
   const clearFloorPlanImage = () => {
     if (!project?.floorPlanImage) return;
+    const ownerProjectId = project.id;
     openConfirm({
       title: 'Remove Floor Plan',
       message: 'Remove the floor plan image and all scene pins from this project?',
@@ -101,8 +131,8 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
       tone: 'danger',
       onConfirm: () => {
         const latest = useProjectStore.getState().project;
-        if (!latest) return;
-        updateProject({
+        if (!latest || latest.id !== ownerProjectId) return;
+        useProjectStore.getState().updateProject({
           floorPlanImage: undefined,
           scenes: latest.scenes.map((scene) => ({ ...scene, floorPlan: undefined })),
         });
@@ -129,6 +159,10 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
     if (!isEditing) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      if (useUiStore.getState().confirm.open) return;
+      // The floor-plan panel contributes one Escape layer itself. Any layer
+      // above it owns the keyboard while its modal/overlay is open.
+      if (getEscapeCloseLayerCount() > 1) return;
       e.preventDefault();
       e.stopPropagation();
       setIsEditing(false);
@@ -139,22 +173,27 @@ const FloorPlanPanel: React.FC<FloorPlanPanelProps> = ({ onClose }) => {
   }, [isEditing, pushToast]);
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (useUiStore.getState().confirm.open) return;
+      if (getEscapeCloseLayerCount() > 1) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       const active = document.activeElement as HTMLElement | null;
       const tag = (active?.tagName || '').toUpperCase();
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;
       if (typing) return;
       if (e.key.toLowerCase() === 'n' && nextUnpinnedScene) {
         e.preventDefault();
+        e.stopImmediatePropagation();
         moveToNextUnpinned();
         return;
       }
       if (e.key.toLowerCase() === 'p' && project?.floorPlanImage) {
         e.preventDefault();
+        e.stopImmediatePropagation();
         setIsEditing((prev) => !prev);
       }
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [nextUnpinnedScene, project?.floorPlanImage]);
 
   if (!project) return null;

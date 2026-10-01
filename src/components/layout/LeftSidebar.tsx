@@ -1,34 +1,93 @@
 import React from 'react';
 import { Image as ImageIcon, Trash2, Layers, Copy, ArrowUp, ArrowDown, GripVertical, Upload, HardDrive } from 'lucide-react';
-import { useProjectStore } from '../../store/projectStore';
+import { runProjectOperation, useProjectStore } from '../../store/projectStore';
 import { cn } from '../../lib/utils';
 import { getDesktopApi, SceneImportProgress } from '../../lib/desktop';
 import { resolveAssetSrc } from '../../lib/media';
 import { useUiStore } from '../../store/uiStore';
+import { hasEscapeCloseLayer } from '../../hooks/useEscapeClose';
+import { BUILD_NUMBER } from '../../lib/buildInfo';
 
 const SCENE_IMPORT_MAX_EDGE = 4096;
 const SCENE_IMPORT_JPEG_QUALITY = 0.88;
+const SUPPORTED_IMAGE_EXTENSION = /\.(?:jpe?g|png|webp)$/i;
+
+function isSupportedImageFile(file: File) {
+  return file.type.startsWith('image/') || SUPPORTED_IMAGE_EXTENSION.test(file.name);
+}
+
+function canonicalProjectAssetKey(projectPath: string, assetPath: string): string | null {
+  const projectRoot = String(projectPath || '').trim().replace(/\\/g, '/').replace(/\/+$/g, '');
+  const asset = String(assetPath || '').trim().replace(/\\/g, '/');
+  if (!projectRoot || !asset || /^(?:data|blob|https?):/i.test(asset)) return null;
+
+  const isWindowsAbsolute = /^[A-Za-z]:\//.test(asset);
+  const isUncAbsolute = asset.startsWith('//');
+  const isPosixAbsolute = asset.startsWith('/') && !isUncAbsolute;
+  const combined = isWindowsAbsolute || isUncAbsolute || isPosixAbsolute
+    ? asset
+    : `${projectRoot}/${asset}`;
+  const windowsStyle = /^[A-Za-z]:\//.test(combined) || combined.startsWith('//');
+
+  let prefix = '';
+  let remainder = combined;
+  let protectedSegments = 0;
+  if (/^[A-Za-z]:\//.test(combined)) {
+    prefix = combined.slice(0, 2);
+    remainder = combined.slice(2).replace(/^\/+/, '');
+  } else if (combined.startsWith('//')) {
+    prefix = '//';
+    remainder = combined.slice(2);
+    // A UNC server/share pair is the filesystem root and must not be removed
+    // while resolving `..` aliases.
+    protectedSegments = 2;
+  } else if (combined.startsWith('/')) {
+    prefix = '/';
+    remainder = combined.slice(1);
+  }
+
+  const segments: string[] = [];
+  for (const segment of remainder.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      if (segments.length > protectedSegments) segments.pop();
+      else if (!prefix) segments.push(segment);
+      continue;
+    }
+    segments.push(segment);
+  }
+
+  const separator = prefix && prefix !== '/' && prefix !== '//' ? '/' : '';
+  const canonical = `${prefix}${separator}${segments.join('/')}`;
+  return windowsStyle ? canonical.toLowerCase() : canonical;
+}
 
 async function resizeSceneImage(dataUrl: string, maxEdge = SCENE_IMPORT_MAX_EDGE): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
-      if (scale >= 1) {
+      try {
+        const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+        if (scale >= 1) {
+          resolve(dataUrl);
+          return;
+        }
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { resolve(dataUrl); return; }
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', SCENE_IMPORT_JPEG_QUALITY));
+      } catch {
+        // Canvas allocation/encoding can throw for extremely large images.
+        // Keep the original rather than leaving the import promise pending.
         resolve(dataUrl);
-        return;
       }
-      const w = Math.max(1, Math.round(img.width * scale));
-      const h = Math.max(1, Math.round(img.height * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) { resolve(dataUrl); return; }
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, w, h);
-      resolve(canvas.toDataURL('image/jpeg', SCENE_IMPORT_JPEG_QUALITY));
     };
     img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
@@ -39,16 +98,20 @@ async function generateThumbnail(dataUrl: string, maxWidth = 320): Promise<strin
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      const scale = Math.min(1, maxWidth / img.width);
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) { resolve(dataUrl); return; }
-      ctx.drawImage(img, 0, 0, w, h);
-      resolve(canvas.toDataURL('image/jpeg', 0.75));
+      try {
+        const scale = Math.min(1, maxWidth / Math.max(1, img.width));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) { resolve(dataUrl); return; }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.75));
+      } catch {
+        resolve(dataUrl);
+      }
     };
     img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
@@ -56,7 +119,7 @@ async function generateThumbnail(dataUrl: string, maxWidth = 320): Promise<strin
 }
 
 const LeftSidebar = () => {
-  const { project, currentSceneId, addScene, setCurrentScene, deleteScene, deleteScenes, updateProject, duplicateScene, moveScene, moveSceneToIndex, moveScenesToIndex, updateScene } = useProjectStore();
+  const { project, currentSceneId, setCurrentScene, deleteScene, deleteScenes, duplicateScene, moveScene, moveSceneToIndex, moveScenesToIndex, updateScene } = useProjectStore();
   const { openConfirm, pushToast } = useUiStore();
   const [draggingId, setDraggingId] = React.useState<string | null>(null);
   const [dragOverIndex, setDragOverIndex] = React.useState<number | null>(null);
@@ -77,6 +140,48 @@ const LeftSidebar = () => {
   const draggingCardHeight = React.useRef<number>(0);
   const draggedIndicesRef = React.useRef<Set<number>>(new Set());
   const totalScenesRef = React.useRef<number>(0);
+  const mountedRef = React.useRef(true);
+  const importEpochRef = React.useRef(0);
+  const desktopImportSequenceRef = React.useRef(0);
+  const activeDesktopImportRef = React.useRef<number | null>(null);
+  const desktopProgressCleanupRef = React.useRef<(() => void) | null>(null);
+  const activeReadersRef = React.useRef<Set<FileReader>>(new Set());
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // Changing projects invalidates every async stage started by the previous
+  // project. File readers can be aborted; desktop work may continue in the
+  // main process, but its result and progress are ignored here.
+  React.useEffect(() => {
+    importEpochRef.current += 1;
+    activeDesktopImportRef.current = null;
+    desktopProgressCleanupRef.current?.();
+    desktopProgressCleanupRef.current = null;
+    activeReadersRef.current.forEach((reader) => {
+      try { if (reader.readyState === FileReader.LOADING) reader.abort(); } catch {}
+    });
+    activeReadersRef.current.clear();
+    setImportProgress(null);
+    return () => {
+      importEpochRef.current += 1;
+      activeDesktopImportRef.current = null;
+      desktopProgressCleanupRef.current?.();
+      desktopProgressCleanupRef.current = null;
+      activeReadersRef.current.forEach((reader) => {
+        try { if (reader.readyState === FileReader.LOADING) reader.abort(); } catch {}
+      });
+      activeReadersRef.current.clear();
+    };
+  }, [project?.id]);
+
+  const ownsImport = React.useCallback((projectId: string, epoch: number) => (
+    mountedRef.current
+    && importEpochRef.current === epoch
+    && useProjectStore.getState().project?.id === projectId
+  ), []);
 
   const capturePositions = React.useCallback(() => {
     const snapshot: Record<string, DOMRect> = {};
@@ -145,85 +250,138 @@ const LeftSidebar = () => {
     });
   }, [project?.scenes]);
 
-  const addImportedScenes = (scenes: Array<{ name: string; image: string; thumbnail: string }> = []) => {
-    scenes.forEach((scene) => addScene({ name: scene.name, image: scene.image, thumbnail: scene.thumbnail, initialYaw: 0, initialPitch: 0, initialZoom: 20 }));
-  };
-
   const handleDesktopImport = async () => {
     const desktop = getDesktopApi();
     if (!desktop || !project) return;
-    setImportProgress({ stage: 'start', total: 0, current: 0, currentFile: null });
-    let unsubscribeProgress = () => {};
-    if (desktop.onSceneImportProgress) {
-      unsubscribeProgress = desktop.onSceneImportProgress((progress) => {
-        setImportProgress(progress);
-      });
-    }
-    try {
-      const imported = await desktop.importSceneImages(project);
-      const importedPath = (imported as any)?.projectPath;
-      const importedScenes = Array.isArray((imported as any)?.scenes) ? (imported as any).scenes : [];
-      if (importedPath && importedPath !== project.path) updateProject({ path: importedPath });
-      addImportedScenes(importedScenes);
-      if (!importedScenes.length) {
-        pushToast('info', 'No scenes were imported.');
+    if (activeDesktopImportRef.current !== null) return;
+
+    const ownerProject = project;
+    const ownerProjectId = ownerProject.id;
+    const ownerEpoch = importEpochRef.current;
+    const operationId = ++desktopImportSequenceRef.current;
+    activeDesktopImportRef.current = operationId;
+    const ownsOperation = () => (
+      activeDesktopImportRef.current === operationId
+      && ownsImport(ownerProjectId, ownerEpoch)
+    );
+
+    await runProjectOperation(ownerProjectId, async () => {
+      setImportProgress({ stage: 'start', total: 0, current: 0, currentFile: null });
+      let unsubscribeProgress = () => {};
+      if (desktop.onSceneImportProgress) {
+        unsubscribeProgress = desktop.onSceneImportProgress((progress) => {
+          if (ownsOperation()) setImportProgress(progress);
+        });
+        desktopProgressCleanupRef.current = unsubscribeProgress;
       }
-    } catch {
-      pushToast('error', 'Failed to import scenes');
-    } finally {
-      unsubscribeProgress();
-      setImportProgress(null);
-    }
+      try {
+        const imported = await desktop.importSceneImages(ownerProject);
+        if (!ownsOperation()) return;
+        const importedPath = imported?.projectPath;
+        const importedScenes = Array.isArray(imported?.scenes) ? imported.scenes : [];
+        const state = useProjectStore.getState();
+        if (state.project?.id !== ownerProjectId) return;
+        if (importedPath && importedPath !== state.project.path) state.updateProject({ path: importedPath });
+        importedScenes.forEach((scene) => {
+          if (!ownsOperation()) return;
+          useProjectStore.getState().addScene({
+            name: scene.name,
+            image: scene.image,
+            thumbnail: scene.thumbnail,
+            initialYaw: 0,
+            initialPitch: 0,
+            initialZoom: 20,
+          });
+        });
+        if (!importedScenes.length) {
+          pushToast('info', 'No scenes were imported.');
+        }
+      } catch {
+        if (ownsOperation()) pushToast('error', 'Failed to import scenes');
+      } finally {
+        unsubscribeProgress();
+        if (desktopProgressCleanupRef.current === unsubscribeProgress) {
+          desktopProgressCleanupRef.current = null;
+        }
+        if (activeDesktopImportRef.current === operationId) {
+          activeDesktopImportRef.current = null;
+        }
+        if (ownsImport(ownerProjectId, ownerEpoch)) setImportProgress(null);
+      }
+    });
   };
 
   const processImportedFiles = React.useCallback(async (files: File[]) => {
     if (files.length === 0) return;
-    for (const file of files) {
-      if (file.size > 8 * 1024 * 1024) {
-        pushToast('info', `"${file.name}" is ${(file.size / (1024 * 1024)).toFixed(1)}MB — large images may slow performance`);
-      }
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise<void>((resolve) => {
-        const reader = new FileReader();
-        reader.onload = async () => {
-          const dataUrl = String(reader.result || '');
-          const img = new Image();
-          const loadOk = await new Promise<boolean>((res) => {
-            img.onload = () => res(true);
-            img.onerror = () => res(false);
-            img.src = dataUrl;
-          });
-          if (!loadOk) {
-            pushToast('error', `"${file.name}" is corrupt or not a valid image — skipped`);
+    const ownerProjectId = useProjectStore.getState().project?.id;
+    if (!ownerProjectId) return;
+    const ownerEpoch = importEpochRef.current;
+    const ownsOperation = () => ownsImport(ownerProjectId, ownerEpoch);
+
+    await runProjectOperation(ownerProjectId, async () => {
+      for (const file of files) {
+        if (!ownsOperation()) return;
+        if (file.size > 8 * 1024 * 1024) {
+          pushToast('info', `"${file.name}" is ${(file.size / (1024 * 1024)).toFixed(1)}MB — large images may slow performance`);
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise<void>((resolve) => {
+          if (!ownsOperation()) { resolve(); return; }
+          const reader = new FileReader();
+          activeReadersRef.current.add(reader);
+          const finishReader = () => activeReadersRef.current.delete(reader);
+          reader.onload = async () => {
+            finishReader();
+            try {
+              if (!ownsOperation()) return;
+              const dataUrl = String(reader.result || '');
+              const img = new Image();
+              const loadOk = await new Promise<boolean>((res) => {
+                img.onload = () => res(true);
+                img.onerror = () => res(false);
+                img.src = dataUrl;
+              });
+              if (!ownsOperation()) return;
+              if (!loadOk) {
+                pushToast('error', `"${file.name}" is corrupt or not a valid image — skipped`);
+                return;
+              }
+              const w = img.naturalWidth;
+              const h = img.naturalHeight;
+              const aspect = h > 0 ? w / h : 0;
+              if (aspect > 0 && (aspect < 1.5 || aspect > 3.5)) {
+                pushToast('info', `"${file.name}" is ${w}×${h} (${aspect.toFixed(1)}:1). Expected ~2:1 for 360° panoramas.`);
+              }
+              const sceneImage = await resizeSceneImage(dataUrl);
+              if (!ownsOperation()) return;
+              const thumbnail = await generateThumbnail(sceneImage, 320);
+              if (!ownsOperation()) return;
+              const name = file.name.replace(/\.[^.]+$/, '') || file.name;
+              useProjectStore.getState().addScene({ name, image: sceneImage, thumbnail, initialYaw: 0, initialPitch: 0, initialZoom: 20 });
+              pushToast('success', `Imported "${file.name}" — ${w}×${h}`);
+            } catch {
+              if (ownsOperation()) pushToast('error', `Failed to process "${file.name}" — skipped`);
+            } finally {
+              resolve();
+            }
+          };
+          reader.onerror = () => {
+            finishReader();
+            if (ownsOperation()) pushToast('error', `Failed to read "${file.name}" — check the file is not locked or corrupt`);
             resolve();
-            return;
-          }
-          const w = img.naturalWidth;
-          const h = img.naturalHeight;
-          const aspect = h > 0 ? w / h : 0;
-          if (aspect > 0 && (aspect < 1.5 || aspect > 3.5)) {
-            pushToast('info', `"${file.name}" is ${w}×${h} (${aspect.toFixed(1)}:1). Expected ~2:1 for 360° panoramas.`);
-          } else if (w > 0 && h > 0) {
-            pushToast('success', `Imported "${file.name}" — ${w}×${h}`);
-          }
+          };
+          reader.onabort = () => { finishReader(); resolve(); };
           try {
-            const sceneImage = await resizeSceneImage(dataUrl);
-            const thumbnail = await generateThumbnail(sceneImage, 320);
-            addScene({ name: file.name.split('.')[0], image: sceneImage, thumbnail, initialYaw: 0, initialPitch: 0, initialZoom: 20 });
+            reader.readAsDataURL(file);
           } catch {
-            addScene({ name: file.name.split('.')[0], image: dataUrl, thumbnail: dataUrl, initialYaw: 0, initialPitch: 0, initialZoom: 20 });
+            finishReader();
+            if (ownsOperation()) pushToast('error', `Failed to read "${file.name}" — skipped`);
+            resolve();
           }
-          resolve();
-        };
-        reader.onerror = () => {
-          pushToast('error', `Failed to read "${file.name}" — check the file is not locked or corrupt`);
-          resolve();
-        };
-        reader.onabort = () => { resolve(); };
-        reader.readAsDataURL(file);
-      });
-    }
-  }, [addScene, pushToast]);
+        });
+      }
+    });
+  }, [ownsImport, pushToast]);
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const desktop = getDesktopApi();
@@ -232,8 +390,8 @@ const LeftSidebar = () => {
       return;
     }
     const files = Array.from(e.target.files || []) as File[];
+    e.target.value = '';
     await processImportedFiles(files);
-    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const isExternalFileDrag = (e: React.DragEvent) =>
@@ -294,13 +452,17 @@ const LeftSidebar = () => {
     e.preventDefault();
     const desktop = getDesktopApi();
     if (desktop) return;
-    const files = Array.from(e.dataTransfer.files).filter((f) => (f as File).type.startsWith('image/')) as File[];
+    // Some desktop drag sources omit MIME type, so also recognize supported
+    // image extensions instead of silently discarding valid panoramas.
+    const files = Array.from(e.dataTransfer.files).filter((file) => isSupportedImageFile(file as File)) as File[];
     await processImportedFiles(files);
   };
 
   const confirmDeleteSceneFromDisk = (sceneId: string) => {
     const scene = project?.scenes.find((s) => s.id === sceneId);
-    if (!scene) return;
+    if (!scene || !project) return;
+    const ownerProjectId = project.id;
+    const ownerProjectPath = project.path;
     openConfirm({
       title: 'Delete Scene and File',
       message: `This will remove "${scene.name}" from the project AND permanently delete the image file from your folder. This cannot be undone.`,
@@ -308,22 +470,59 @@ const LeftSidebar = () => {
       cancelLabel: 'Cancel',
       tone: 'danger',
       onConfirm: async () => {
-        const desktop = getDesktopApi();
-        const projectPath = project?.path;
-        if (desktop && projectPath) {
-          const targets = Array.from(
-            new Set([scene.image, scene.thumbnail].filter((p): p is string => !!p && !p.startsWith('data:'))),
-          );
-          let imageRemoved = true;
-          for (const rel of targets) {
-            const ok = await desktop.deleteFile(projectPath, rel);
-            if (!ok && rel === scene.image) imageRemoved = false;
+        await runProjectOperation(ownerProjectId, async () => {
+          const initialState = useProjectStore.getState();
+          const latestProject = initialState.project;
+          const latestScene = latestProject?.scenes.find((item) => item.id === sceneId);
+          if (!latestProject || latestProject.id !== ownerProjectId || !latestScene) return;
+
+          const desktop = getDesktopApi();
+          let removedAnyFile = false;
+          if (desktop && ownerProjectPath) {
+            const referencedByOtherConsumers = new Set(
+              [
+                ...latestProject.scenes
+                  .filter((item) => item.id !== sceneId)
+                  .flatMap((item) => [
+                    item.image,
+                    item.thumbnail,
+                    ...(item.markers ?? []).map((marker) => marker.image),
+                  ]),
+                ...(latestProject.galleryImages ?? []),
+                latestProject.logo,
+                latestProject.floorPlanImage,
+                latestProject.brandingSettings?.logoPath,
+              ]
+                .map((value) => canonicalProjectAssetKey(ownerProjectPath, value || ''))
+                .filter((value): value is string => !!value),
+            );
+            const targetsByKey = new Map<string, string>();
+            for (const value of [latestScene.image, latestScene.thumbnail]) {
+              if (!value || value.startsWith('data:')) continue;
+              const key = canonicalProjectAssetKey(ownerProjectPath, value);
+              if (!key || referencedByOtherConsumers.has(key) || targetsByKey.has(key)) continue;
+              targetsByKey.set(key, value);
+            }
+            const targets = Array.from(targetsByKey.values());
+            let imageRemoved = true;
+            for (const rel of targets) {
+              const ok = await desktop.deleteFile(ownerProjectPath, rel);
+              if (ok) removedAnyFile = true;
+              if (!ok && rel === latestScene.image) imageRemoved = false;
+            }
+            if (!imageRemoved) {
+              pushToast('error', `Could not delete the image file for "${latestScene.name}" from disk — removing from project only`);
+            } else if (targets.length === 0 && [latestScene.image, latestScene.thumbnail].some((value) => !!value && !value.startsWith('data:'))) {
+              pushToast('info', 'The image file was kept because another scene still uses it.');
+            }
           }
-          if (!imageRemoved) {
-            pushToast('error', `Could not delete the image file for "${scene.name}" from disk — removing from project only`);
-          }
-        }
-        deleteScene(sceneId);
+          const finalState = useProjectStore.getState();
+          if (finalState.project?.id !== ownerProjectId || !finalState.project.scenes.some((item) => item.id === sceneId)) return;
+          finalState.deleteScene(sceneId);
+          // Undo cannot safely restore a scene after one of its backing files was
+          // permanently removed. Drop snapshots that would resurrect broken refs.
+          if (removedAnyFile) finalState.clearHistory();
+        });
       },
     });
   };
@@ -355,9 +554,12 @@ const LeftSidebar = () => {
 
   React.useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (useUiStore.getState().confirm.open) return;
+      if (hasEscapeCloseLayer()) return;
       const active = document.activeElement as HTMLElement | null;
       const tag = (active?.tagName || '').toUpperCase();
       const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;
+      if (active?.closest('button, a[href], [role="button"]')) return;
       if (isTyping) return;
       if (e.key === 'Escape') {
         setContextMenu(null);
@@ -794,7 +996,7 @@ const LeftSidebar = () => {
               Select All
             </button>
           )}
-          <span className="text-primary/60">PANORADESK 360 · Build {__BUILD_NUMBER__}</span>
+          <span className="text-primary/60">PANORADESK 360 · Build {BUILD_NUMBER}</span>
         </div>
       </div>
     </aside>

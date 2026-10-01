@@ -4,6 +4,7 @@ const fsSync = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const http = require('node:http');
+const { createHash } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const archiver = require('archiver');
 
@@ -27,12 +28,13 @@ protocol.registerSchemesAsPrivileged([
       supportFetchAPI: true,
       stream: true,
       corsEnabled: true,
-      bypassCSP: true,
     },
   },
 ]);
 
-const isDev = !app.isPackaged;
+// PANORADESK_USE_DIST=1 runs an unpackaged app against the built dist/ (see
+// scripts/run-local.mjs) instead of the Vite dev server.
+const isDev = !app.isPackaged && process.env.PANORADESK_USE_DIST !== '1';
 
 // Windows' Documents folder is frequently redirected into OneDrive by its
 // "Back up your folders" feature. Storing tours there means every panorama is
@@ -75,6 +77,8 @@ const SCENE_IMPORT_MAX_EDGE = 4096;
 const SCENE_THUMBNAIL_MAX_EDGE = 512;
 const SCENE_IMPORT_JPEG_QUALITY = 88;
 const SCENE_THUMBNAIL_JPEG_QUALITY = 72;
+const PROJECT_OWNERSHIP_MARKER = '.panoradesk-project';
+const TOUR_OWNERSHIP_MANIFEST = '.panoradesk-tour.json';
 const APP_ICON_CANDIDATES = [
   path.join(process.cwd(), 'build', 'icon.png'),
   path.join(__dirname, '..', 'build', 'icon.png'),
@@ -86,6 +90,21 @@ const previewServers = new Map();
 let mainWindow = null;
 let allowAppClose = false;
 let appCloseFallbackTimer = null;
+let pendingCloseRequestId = null;
+let closeRequestSequence = 0;
+const CLOSE_FLUSH_TIMEOUT_MS = 15_000;
+const projectSaveQueues = new Map();
+let projectQueueAdmission = Promise.resolve();
+const websiteDeployQueues = new Map();
+const previewOperationQueues = new Map();
+const criticalMainOperations = new Map();
+let criticalMainOperationSequence = 0;
+let deferredQuitPromise = null;
+let allowQuitAfterCriticalOperations = false;
+const deletingProjectIds = new Set();
+const retiredProjectIdentities = new Set();
+const authorizedProjectMediaRoots = new Map();
+let exportStageSequence = 0;
 const LOG_DIR = path.join(DATA_HOME, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'startup.log');
 async function logLine(message) {
@@ -110,8 +129,235 @@ function slugify(value) {
   return String(value || 'project').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60) || 'project';
 }
 
+function exportProjectId(project) {
+  const projectId = String(project?.id || '').trim();
+  if (!projectId) throw new Error('This project has no ID and cannot be exported safely. Save it, then try again.');
+  return projectId;
+}
+
+function exportProjectHash(project) {
+  return createHash('sha256').update(exportProjectId(project)).digest('hex');
+}
+
+function tourRouteParts(project, hashLength = 16) {
+  // Public routes must be tied to immutable project identity. Including the
+  // editable project name here made a rename publish a second live copy while
+  // leaving the old tour (and any removed assets) publicly reachable.
+  const idSuffix = exportProjectHash(project).slice(0, hashLength);
+  const routeKey = idSuffix;
+  return {
+    routeKey,
+    folderName: `panoradesk360-${routeKey}`,
+    tourId: `pd-${routeKey}`,
+    pageSlug: `tour-${routeKey}`,
+  };
+}
+
+function siblingWorkPath(targetPath, label) {
+  exportStageSequence += 1;
+  const suffix = `${process.pid}-${Date.now()}-${exportStageSequence}`;
+  return path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.${label}-${suffix}`);
+}
+
 function normalizeRel(relPath) {
   return String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function isPanoraDeskProjectDocument(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (typeof value.name !== 'string' || !Array.isArray(value.scenes)) return false;
+  const hasProjectMetadata = (
+    (typeof value.createdDate === 'string' && typeof value.modifiedDate === 'string')
+    || (value.exportSettings && typeof value.exportSettings === 'object')
+    || (value.hotspotStyle && typeof value.hotspotStyle === 'object')
+  );
+  if (!hasProjectMetadata) return false;
+  return value.scenes.every((scene) => (
+    scene
+    && typeof scene === 'object'
+    && typeof scene.name === 'string'
+    && typeof scene.image === 'string'
+  ));
+}
+
+function projectIdentityValidationError(project) {
+  const sceneIds = new Set();
+  for (const scene of (project?.scenes || [])) {
+    const sceneId = String(scene?.id || '').trim();
+    if (sceneId) {
+      if (sceneIds.has(sceneId)) return `scene ID "${sceneId}" is duplicated`;
+      sceneIds.add(sceneId);
+    }
+
+    const objectIds = new Set();
+    for (const item of [
+      ...(Array.isArray(scene?.hotspots) ? scene.hotspots : []),
+      ...(Array.isArray(scene?.markers) ? scene.markers : []),
+    ]) {
+      const objectId = String(item?.id || '').trim();
+      if (!objectId) continue;
+      if (objectIds.has(objectId)) {
+        return `object ID "${objectId}" is duplicated in scene "${String(scene?.name || 'Untitled Scene')}"`;
+      }
+      objectIds.add(objectId);
+    }
+  }
+  return null;
+}
+
+function enqueueProjectSave(projectDir, projectId, write) {
+  let queued;
+  const admit = async () => {
+    const pathKey = await canonicalProjectPathKey(projectDir);
+    const keys = [`path:${pathKey}`];
+    const normalizedProjectId = String(projectId || '').trim();
+    if (normalizedProjectId) keys.push(`id:${normalizedProjectId}`);
+
+    // Lock both the real (junction-collapsed) path and stable project identity.
+    // A collision can redirect writes to a sibling, so the ID lock also keeps
+    // an older requested-path operation behind a delete using the returned path.
+    const previous = Promise.all(keys.map((key) => (
+      projectSaveQueues.get(key)?.catch(() => {}) || Promise.resolve()
+    )));
+    queued = previous.then(() => write());
+    for (const key of keys) projectSaveQueues.set(key, queued);
+    const clear = () => {
+      for (const key of keys) {
+        if (projectSaveQueues.get(key) === queued) projectSaveQueues.delete(key);
+      }
+    };
+    void queued.then(clear, clear);
+  };
+
+  // Canonicalization is asynchronous. Admit requests in call order so two
+  // concurrent saves cannot reverse merely because one realpath() resolves
+  // first; admission itself does not wait for unrelated project writes.
+  const admitted = projectQueueAdmission.then(admit, admit);
+  projectQueueAdmission = admitted.catch(() => {});
+  return admitted.then(() => queued);
+}
+
+function enqueueWebsiteDeploy(websiteDir, deploy) {
+  const resolved = path.resolve(websiteDir);
+  const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  const previous = websiteDeployQueues.get(key) || Promise.resolve();
+  const queued = previous.then(deploy, deploy);
+  websiteDeployQueues.set(key, queued);
+  const clear = () => {
+    if (websiteDeployQueues.get(key) === queued) websiteDeployQueues.delete(key);
+  };
+  void queued.then(clear, clear);
+  return queued;
+}
+
+function enqueuePreviewOperation(key, operation) {
+  const previous = previewOperationQueues.get(key) || Promise.resolve();
+  const queued = previous.then(operation, operation);
+  previewOperationQueues.set(key, queued);
+  const clear = () => {
+    if (previewOperationQueues.get(key) === queued) previewOperationQueues.delete(key);
+  };
+  void queued.then(clear, clear);
+  return queued;
+}
+
+function runCriticalMainOperation(label, operation) {
+  const operationId = ++criticalMainOperationSequence;
+  const promise = Promise.resolve().then(operation);
+  criticalMainOperations.set(operationId, { label, promise });
+  const clear = () => {
+    const pending = criticalMainOperations.get(operationId);
+    if (pending?.promise === promise) criticalMainOperations.delete(operationId);
+  };
+  void promise.then(clear, clear);
+  return promise;
+}
+
+const CRITICAL_QUIT_WAIT_MS = 60_000;
+
+async function waitForCriticalMainOperations() {
+  // Bounded: a hung network write must not make the app impossible to quit.
+  const deadline = Date.now() + CRITICAL_QUIT_WAIT_MS;
+  while (criticalMainOperations.size > 0 && Date.now() < deadline) {
+    await Promise.race([
+      Promise.allSettled(Array.from(criticalMainOperations.values(), (pending) => pending.promise)),
+      new Promise((resolve) => setTimeout(resolve, Math.max(0, deadline - Date.now()))),
+    ]);
+  }
+  if (criticalMainOperations.size > 0) {
+    await logLine('quit wait timed out; exiting with critical operations still running');
+  }
+}
+
+function projectPathKey(projectDir) {
+  const resolved = path.resolve(String(projectDir || ''));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function canonicalProjectPath(projectDir) {
+  const resolved = path.resolve(String(projectDir || ''));
+  let existingAncestor = resolved;
+  const missingSegments = [];
+
+  // realpath() is the only reliable way to collapse junction/symlink aliases.
+  // For a new project, walk up to the nearest existing ancestor and append the
+  // missing suffix so creation through an aliased parent still shares a lock
+  // with the canonical spelling of that same future directory.
+  while (true) {
+    try {
+      const realAncestor = await fs.realpath(existingAncestor);
+      return path.resolve(realAncestor, ...missingSegments);
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return resolved;
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) return resolved;
+      missingSegments.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+async function canonicalProjectPathKey(projectDir) {
+  return projectPathKey(await canonicalProjectPath(projectDir));
+}
+
+async function projectIdentityKey(projectDir, projectId) {
+  return `${await canonicalProjectPathKey(projectDir)}\u0000${String(projectId || '')}`;
+}
+
+async function isRetiredProjectIdentity(projectDir, projectId) {
+  return retiredProjectIdentities.has(await projectIdentityKey(projectDir, projectId));
+}
+
+async function isWithinCanonicalDir(rootDir, targetPath) {
+  const [realRoot, realTarget] = await Promise.all([
+    canonicalProjectPath(rootDir),
+    canonicalProjectPath(targetPath),
+  ]);
+  return isWithinDir(realRoot, realTarget);
+}
+
+function disambiguatedProjectId(originalId, projectDir, salt = 0) {
+  const hex = createHash('sha256')
+    .update(`${String(originalId || '')}\u0000${projectPathKey(projectDir)}\u0000${salt}`)
+    .digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+let atomicProjectWriteSequence = 0;
+async function writeProjectFileAtomic(projectDir, payload) {
+  const targetFile = path.join(projectDir, 'project.json');
+  const tmpFile = path.join(
+    projectDir,
+    `.project.json.tmp-${process.pid}-${Date.now()}-${++atomicProjectWriteSequence}`,
+  );
+  try {
+    await fs.writeFile(tmpFile, JSON.stringify(payload, null, 2), 'utf-8');
+    await fs.rename(tmpFile, targetFile);
+  } catch (error) {
+    try { await fs.rm(tmpFile, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function isRelativeAssetPath(value) {
@@ -136,11 +382,20 @@ function isDataUrl(value) {
 }
 
 function isAppMediaLocal(value) {
-  return /^app-media:\/\/local\//i.test(String(value || '').trim());
+  return /^app-media:\/\/local(?:\/|$)/i.test(String(value || '').trim());
 }
 
 function appMediaToLocalPath(value) {
-  return String(value || '').trim().replace(/^app-media:\/\/local\//i, '');
+  const rawValue = String(value || '').trim();
+  try {
+    const mediaUrl = new URL(rawValue);
+    const explicitPath = mediaUrl.searchParams.get('path');
+    if (explicitPath) return explicitPath;
+    const decoded = decodeURIComponent(mediaUrl.pathname);
+    return /^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded;
+  } catch {
+    return rawValue.replace(/^app-media:\/\/local\//i, '');
+  }
 }
 
 function isAbsoluteFilePath(value) {
@@ -178,23 +433,82 @@ async function readRecentProjectPaths() {
   }
 }
 
-async function writeRecentProjectPaths(paths) {
-  const normalized = Array.from(new Set(
-    (Array.isArray(paths) ? paths : [])
-      .map((item) => String(item || '').trim())
-      .filter((item) => item.length > 0),
-  ));
-  await ensureDir(path.dirname(RECENTS_FILE));
-  await fs.writeFile(RECENTS_FILE, JSON.stringify(normalized, null, 2), 'utf-8');
+let recentProjectsMutationQueue = Promise.resolve();
+let recentProjectsWriteSequence = 0;
+
+function normalizeRecentProjectPaths(paths) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of Array.isArray(paths) ? paths : []) {
+    const value = String(item || '').trim();
+    if (!value) continue;
+    const key = projectPathKey(value);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(value);
+    if (normalized.length >= 200) break;
+  }
+  return normalized;
+}
+
+async function writeRecentProjectPathsUnlocked(paths) {
+  const normalized = normalizeRecentProjectPaths(paths);
+  const tmpFile = path.join(
+    path.dirname(RECENTS_FILE),
+    `.recent-projects.json.tmp-${process.pid}-${Date.now()}-${++recentProjectsWriteSequence}`,
+  );
+  try {
+    await ensureDir(path.dirname(RECENTS_FILE));
+    await fs.writeFile(tmpFile, JSON.stringify(normalized, null, 2), 'utf-8');
+    await fs.rename(tmpFile, RECENTS_FILE);
+  } catch (error) {
+    try { await fs.rm(tmpFile, { force: true }); } catch {}
+    // Recents are only an index. A failed index update must not turn an
+    // already-successful manifest save/delete into a reported failure.
+    await logLine(`Unable to update recent projects: ${String(error?.message || error)}`);
+  }
+}
+
+function mutateRecentProjectPaths(mutate) {
+  const run = async () => {
+    const current = await readRecentProjectPaths();
+    const next = await mutate(current);
+    await writeRecentProjectPathsUnlocked(next);
+  };
+  const queued = recentProjectsMutationQueue.then(run, run);
+  recentProjectsMutationQueue = queued.catch(() => {});
+  return queued;
 }
 
 async function touchRecentProjectPath(projectDir) {
   const normalizedDir = String(projectDir || '').trim();
   if (!normalizedDir) return;
-  const existing = await readRecentProjectPaths();
-  const filtered = existing.filter((p) => path.resolve(p) !== path.resolve(normalizedDir));
-  filtered.unshift(normalizedDir);
-  await writeRecentProjectPaths(filtered.slice(0, 200));
+  const targetKey = projectPathKey(normalizedDir);
+  await mutateRecentProjectPaths((existing) => [
+    normalizedDir,
+    ...existing.filter((item) => projectPathKey(item) !== targetKey),
+  ]);
+}
+
+async function mergeRecentProjectPaths(projectDirs) {
+  const incoming = normalizeRecentProjectPaths(projectDirs);
+  const incomingKeys = new Set(incoming.map((item) => projectPathKey(item)));
+  await mutateRecentProjectPaths(async (existing) => {
+    // Keep entries list did not return only while their manifest still exists
+    // (e.g. a project that failed to parse this round); drop stale ones.
+    const candidates = existing.filter((item) => !incomingKeys.has(projectPathKey(item)));
+    const present = await Promise.all(
+      candidates.map((item) => pathExists(path.join(item, 'project.json'))),
+    );
+    return [...incoming, ...candidates.filter((_, index) => present[index])];
+  });
+}
+
+async function removeRecentProjectPath(projectDir) {
+  const targetKey = projectPathKey(projectDir);
+  await mutateRecentProjectPaths((existing) => (
+    existing.filter((item) => projectPathKey(item) !== targetKey)
+  ));
 }
 
 // Walking every drive root is expensive (mapped network drives can block for
@@ -292,23 +606,354 @@ function isWithinDir(rootDir, targetPath) {
   return targetResolved === rootResolved || targetResolved.startsWith(`${rootResolved}${path.sep}`);
 }
 
+function authorizeProjectMediaRoot(projectDir) {
+  const rawProjectDir = String(projectDir || '').trim();
+  if (!rawProjectDir) return;
+  const resolvedProjectDir = path.resolve(rawProjectDir);
+  if (!resolvedProjectDir || resolvedProjectDir === path.parse(resolvedProjectDir).root) return;
+  authorizedProjectMediaRoots.set(projectPathKey(resolvedProjectDir), {
+    projectDir: resolvedProjectDir,
+    mediaRoots: [
+      path.join(resolvedProjectDir, 'panoramas'),
+      path.join(resolvedProjectDir, 'thumbnails'),
+      path.join(resolvedProjectDir, 'assets'),
+    ],
+  });
+}
+
+function revokeProjectMediaRoot(projectDir) {
+  authorizedProjectMediaRoots.delete(projectPathKey(projectDir));
+}
+
+const SAFE_PROJECT_MEDIA_EXTENSIONS = new Set([
+  '.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.webp',
+]);
+
+async function isAuthorizedProjectMediaFile(filePath) {
+  if (!SAFE_PROJECT_MEDIA_EXTENSIONS.has(path.extname(filePath).toLowerCase())) return false;
+  const resolvedFile = path.resolve(filePath);
+  const candidate = Array.from(authorizedProjectMediaRoots.values())
+    .map((entry) => ({
+      entry,
+      mediaRoot: entry.mediaRoots.find((root) => isWithinDir(root, resolvedFile)),
+    }))
+    .find(({ mediaRoot }) => !!mediaRoot);
+  if (!candidate?.mediaRoot) return false;
+
+  // A symlink inside an otherwise-authorized assets folder must not turn the
+  // custom protocol into a reader for files elsewhere on the machine.
+  const [realProjectDir, realRoot, realFile] = await Promise.all([
+    fs.realpath(candidate.entry.projectDir).catch(() => null),
+    fs.realpath(candidate.mediaRoot).catch(() => null),
+    fs.realpath(resolvedFile).catch(() => null),
+  ]);
+  return !!realProjectDir
+    && !!realRoot
+    && !!realFile
+    && isWithinDir(realProjectDir, realRoot)
+    && isWithinDir(realRoot, realFile);
+}
+
 function projectAbsolute(projectDir, relPath) {
   const resolved = path.resolve(projectDir, normalizeRel(relPath));
   if (!isWithinDir(projectDir, resolved)) return null;
   return resolved;
 }
 
+async function projectIdAtPath(projectDir) {
+  const projectFile = path.join(projectDir, 'project.json');
+  if (!(await pathExists(projectFile))) return null;
+  try {
+    const parsed = JSON.parse(await fs.readFile(projectFile, 'utf-8'));
+    return parsed?.id !== undefined && parsed?.id !== null && String(parsed.id)
+      ? String(parsed.id)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function ownershipMarkerIdAtPath(projectDir) {
+  try {
+    const raw = await fs.readFile(path.join(projectDir, PROJECT_OWNERSHIP_MARKER), 'utf-8');
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.id === 'string' && parsed.id ? parsed.id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isProvablyDedicatedLegacyProjectDir(projectDir, projectId) {
+  const resolvedDir = path.resolve(projectDir);
+  const rootResolved = path.resolve(PROJECTS_ROOT);
+  const dataHomeResolved = path.resolve(DATA_HOME);
+  const [canonicalDir, canonicalRoot, canonicalDataHome] = await Promise.all([
+    canonicalProjectPath(resolvedDir),
+    canonicalProjectPath(rootResolved),
+    canonicalProjectPath(dataHomeResolved),
+  ]);
+  if (
+    canonicalDir === path.parse(canonicalDir).root
+    || projectPathKey(canonicalDir) === projectPathKey(canonicalRoot)
+    || projectPathKey(canonicalDir) === projectPathKey(canonicalDataHome)
+  ) return false;
+
+  const projectFile = path.join(resolvedDir, 'project.json');
+  try {
+    const parsed = JSON.parse(await fs.readFile(projectFile, 'utf-8'));
+    if (!isPanoraDeskProjectDocument(parsed) || String(parsed.id || '') !== String(projectId || '')) {
+      return false;
+    }
+
+    const entries = await fs.readdir(resolvedDir, { withFileTypes: true });
+    const allowedNames = new Set([
+      'project.json',
+      PROJECT_OWNERSHIP_MARKER,
+      'panoramas',
+      'thumbnails',
+      'exports',
+      'assets',
+    ]);
+    if (entries.some((entry) => !allowedNames.has(entry.name))) return false;
+
+    const directories = new Set(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name));
+    return ['panoramas', 'thumbnails', 'exports', 'assets'].every((name) => directories.has(name));
+  } catch {
+    return false;
+  }
+}
+
+async function migrateLegacyOwnershipMarkerIfSafe(projectDir, projectId) {
+  if (await isWithinCanonicalDir(PROJECTS_ROOT, projectDir)) return false;
+  if (await ownershipMarkerIdAtPath(projectDir)) return false;
+  if (!(await isProvablyDedicatedLegacyProjectDir(projectDir, projectId))) return false;
+  await fs.writeFile(
+    path.join(projectDir, PROJECT_OWNERSHIP_MARKER),
+    JSON.stringify({ id: String(projectId), createdBy: 'PanoraDesk 360' }, null, 2),
+    'utf-8',
+  );
+  return true;
+}
+
+async function resolveWritableProjectDir(project) {
+  const requested = path.resolve(getProjectDir(project));
+  if (!(await pathExists(requested))) return { projectDir: requested, createOwnershipMarker: true };
+
+  const existingId = await projectIdAtPath(requested);
+  const markerId = await ownershipMarkerIdAtPath(requested);
+  if (existingId === project.id || (!existingId && markerId === project.id)) {
+    return { projectDir: requested, createOwnershipMarker: false };
+  }
+
+  // An existing non-empty/corrupt folder is not safe to claim. Allocate a
+  // stable sibling based on this project's ID, then add a numeric suffix only
+  // if that sibling is also owned by something else.
+  if (!existingId) {
+    try {
+      const entries = await fs.readdir(requested);
+      if (entries.length === 0) return { projectDir: requested, createOwnershipMarker: true };
+    } catch {}
+  }
+
+  const parentDir = path.dirname(requested);
+  const baseName = path.basename(requested);
+  const idSuffix = slugify(project.id).slice(0, 8) || 'project';
+  for (let index = 1; index < 10_000; index += 1) {
+    const suffix = index === 1 ? idSuffix : `${idSuffix}-${index}`;
+    const candidate = path.join(parentDir, `${baseName}-${suffix}`);
+    if (!(await pathExists(candidate))) return { projectDir: candidate, createOwnershipMarker: true };
+    const candidateProjectId = await projectIdAtPath(candidate);
+    if (
+      candidateProjectId === project.id
+      || (!candidateProjectId && (await ownershipMarkerIdAtPath(candidate)) === project.id)
+    ) {
+      return { projectDir: candidate, createOwnershipMarker: false };
+    }
+  }
+  throw new Error(`Unable to allocate a unique project folder beside: ${requested}`);
+}
+
 async function ensureProjectScaffold(project) {
   await ensureProjectRoot();
-  const projectDir = getProjectDir(project);
+  const { projectDir, createOwnershipMarker } = await resolveWritableProjectDir(project);
+  // Skip the manifest read/readdir on every save once the marker is correct.
+  const migrateLegacyMarker = !createOwnershipMarker
+    && (await ownershipMarkerIdAtPath(projectDir)) !== project.id
+    && await isProvablyDedicatedLegacyProjectDir(projectDir, project.id);
   await ensureDir(projectDir);
+  if (createOwnershipMarker || migrateLegacyMarker) {
+    await fs.writeFile(
+      path.join(projectDir, PROJECT_OWNERSHIP_MARKER),
+      JSON.stringify({ id: project.id, createdBy: 'PanoraDesk 360' }, null, 2),
+      'utf-8',
+    );
+  }
   await ensureDir(path.join(projectDir, 'panoramas'));
   await ensureDir(path.join(projectDir, 'thumbnails'));
   await ensureDir(path.join(projectDir, 'exports'));
   await ensureDir(path.join(projectDir, 'assets', 'logo'));
   await ensureDir(path.join(projectDir, 'assets', 'icons'));
   await ensureDir(path.join(projectDir, 'assets', 'floorplans'));
+  authorizeProjectMediaRoot(projectDir);
   return projectDir;
+}
+
+async function migrateProjectIdentityLocked(resolvedDir, current, expectedId, nextId) {
+  if (String(current?.id || '') !== String(expectedId || '')) {
+    return { ...current, path: resolvedDir };
+  }
+
+  const retiredKey = await projectIdentityKey(resolvedDir, expectedId);
+  retiredProjectIdentities.add(retiredKey);
+  const migrated = { ...current, id: nextId, path: resolvedDir };
+  try {
+    await writeProjectFileAtomic(resolvedDir, migrated);
+  } catch (error) {
+    retiredProjectIdentities.delete(retiredKey);
+    throw error;
+  }
+
+  const markerId = await ownershipMarkerIdAtPath(resolvedDir);
+  if (markerId) {
+    try {
+      await fs.writeFile(
+        path.join(resolvedDir, PROJECT_OWNERSHIP_MARKER),
+        JSON.stringify({ id: nextId, createdBy: 'PanoraDesk 360' }, null, 2),
+        'utf-8',
+      );
+    } catch (error) {
+      await logLine(`Unable to update ownership marker for ${resolvedDir}: ${String(error?.message || error)}`);
+    }
+  }
+  return migrated;
+}
+
+async function migrateProjectIdentity(projectDir, expectedId, nextId) {
+  const resolvedDir = path.resolve(projectDir);
+  return enqueueProjectSave(resolvedDir, expectedId, async () => {
+    const projectFile = path.join(resolvedDir, 'project.json');
+    const current = JSON.parse(await fs.readFile(projectFile, 'utf-8'));
+    if (!isPanoraDeskProjectDocument(current)) {
+      throw new Error('Invalid PanoraDesk project manifest.');
+    }
+    return migrateProjectIdentityLocked(resolvedDir, current, expectedId, nextId);
+  });
+}
+
+async function findOtherProjectDirWithId(projectId, selectedDir) {
+  if (!projectId) return null;
+  const candidateDirs = [];
+  try {
+    const entries = await fs.readdir(PROJECTS_ROOT, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) candidateDirs.push(path.join(PROJECTS_ROOT, entry.name));
+    }
+  } catch {}
+  candidateDirs.push(...await readRecentProjectPaths());
+  candidateDirs.push(...await discoverProjectDirs());
+
+  const selectedKey = await canonicalProjectPathKey(selectedDir);
+  const seen = new Set([selectedKey]);
+  for (const candidateDir of candidateDirs) {
+    if (!candidateDir) continue;
+    const resolvedCandidate = path.resolve(candidateDir);
+    const candidateKey = await canonicalProjectPathKey(resolvedCandidate);
+    if (seen.has(candidateKey)) continue;
+    seen.add(candidateKey);
+    try {
+      const candidate = JSON.parse(await fs.readFile(path.join(resolvedCandidate, 'project.json'), 'utf-8'));
+      if (
+        isPanoraDeskProjectDocument(candidate)
+        && String(candidate?.id || '') === String(projectId)
+      ) return resolvedCandidate;
+    } catch {}
+  }
+  return null;
+}
+
+async function normalizeOpenedProjectIdentity(projectDir, initialProject) {
+  const resolvedDir = path.resolve(projectDir);
+  let lockId = String(initialProject?.id || '');
+
+  // A list operation may have rekeyed this manifest after the dialog read it.
+  // Retry under the freshly observed ID so duplicate detection and migration
+  // always occur while holding both the real-path lock and the current ID lock.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await enqueueProjectSave(resolvedDir, lockId, async () => {
+      const current = JSON.parse(await fs.readFile(path.join(resolvedDir, 'project.json'), 'utf-8'));
+      if (!isPanoraDeskProjectDocument(current)) {
+        throw new Error('Invalid PanoraDesk project manifest.');
+      }
+      const currentId = String(current?.id || '');
+      if (currentId !== lockId) return { retryId: currentId };
+
+      const declaredPath = typeof current?.path === 'string' ? current.path : '';
+      const declaredPathMatches = declaredPath
+        ? await Promise.all([
+          canonicalProjectPathKey(declaredPath),
+          canonicalProjectPathKey(resolvedDir),
+        ]).then(([declaredKey, selectedKey]) => declaredKey === selectedKey)
+        : false;
+      // Only a folder that is a genuine copy (another folder already owns this
+      // ID and this manifest does not claim its own location) gets a new
+      // identity. A moved or restored folder keeps its ID, otherwise published
+      // tour routes derived from it would change.
+      const duplicateDir = currentId && !declaredPathMatches
+        ? await findOtherProjectDirWithId(currentId, resolvedDir)
+        : null;
+      if (currentId && !duplicateDir) {
+        return { project: { ...current, path: resolvedDir } };
+      }
+
+      const nextId = disambiguatedProjectId(currentId || 'missing-project-id', resolvedDir);
+      const migrated = await migrateProjectIdentityLocked(resolvedDir, current, currentId, nextId);
+      return { project: migrated };
+    });
+    if (result.project) return result.project;
+    lockId = String(result.retryId || '');
+  }
+  throw new Error('The project identity changed while it was being opened. Please try again.');
+}
+
+async function loadProjectFile(selectedPath, { requireCanonicalManifest = false } = {}) {
+  if (typeof selectedPath !== 'string' || !selectedPath.trim()) {
+    throw new Error('No project file was selected.');
+  }
+
+  const selected = path.resolve(selectedPath);
+  const selectedName = path.basename(selected).toLowerCase();
+  const selectedIsManifest = selectedName === 'project.json';
+  if (selectedName === 'tour.json') {
+    throw new Error('Exported tour.json files cannot be opened as editable projects.');
+  }
+  if (requireCanonicalManifest && !selectedIsManifest) {
+    throw new Error('Drop the project.json file from a PanoraDesk project folder.');
+  }
+
+  const stats = await fs.stat(selected);
+  if (!stats.isFile()) throw new Error('The selected project path is not a file.');
+
+  const raw = await fs.readFile(selected, 'utf-8');
+  let project = JSON.parse(raw);
+  if (!isPanoraDeskProjectDocument(project)) {
+    throw new Error('The selected JSON file is not a PanoraDesk project.');
+  }
+  const identityError = projectIdentityValidationError(project);
+  if (identityError) {
+    throw new Error(`This project cannot be opened safely because ${identityError}.`);
+  }
+
+  const selectedDir = path.dirname(selected);
+  if (selectedIsManifest) project = await normalizeOpenedProjectIdentity(selectedDir, project);
+
+  project.id = String(project?.id || disambiguatedProjectId('opened-project', selectedDir));
+  project.path = selectedDir;
+  if (selectedIsManifest) {
+    await migrateLegacyOwnershipMarkerIfSafe(selectedDir, project.id);
+  }
+  authorizeProjectMediaRoot(selectedDir);
+  await touchRecentProjectPath(project.path);
+  return project;
 }
 
 async function uniqueDestination(dir, baseName) {
@@ -328,7 +973,14 @@ async function copyImageToProject(projectDir, sourcePath, targetSubfolder) {
   await ensureDir(folder);
   const fileName = await uniqueDestination(folder, path.basename(sourcePath));
   const dest = path.join(folder, fileName);
-  await fs.copyFile(sourcePath, dest);
+  try {
+    await fs.copyFile(sourcePath, dest);
+  } catch (error) {
+    // copyFile may leave a partial destination on I/O failure. Never let an
+    // unreturned asset escape the caller's transaction/rollback tracking.
+    try { await fs.rm(dest, { force: true }); } catch {}
+    throw error;
+  }
   return normalizeRel(path.join(targetSubfolder, fileName));
 }
 
@@ -394,11 +1046,19 @@ function decodeDataUrl(dataUrl) {
 }
 
 function extFromMime(mime) {
-  if (mime === 'image/jpeg') return '.jpg';
-  if (mime === 'image/png') return '.png';
-  if (mime === 'image/webp') return '.webp';
-  if (mime === 'image/gif') return '.gif';
-  return '.jpg';
+  const normalized = String(mime || '').split(';', 1)[0].trim().toLowerCase();
+  if (normalized === 'image/jpeg') return '.jpg';
+  if (normalized === 'image/png') return '.png';
+  if (normalized === 'image/webp') return '.webp';
+  if (normalized === 'image/gif') return '.gif';
+  if (normalized === 'image/avif') return '.avif';
+  if (normalized === 'image/svg+xml') return '.svg';
+  return null;
+}
+
+function isSupportedImageDataUrl(value) {
+  const match = /^data:([^;,]+)(?:;[^,]*)?,/i.exec(String(value || '').trim());
+  return !!match && !!extFromMime(match[1]);
 }
 
 function hotspotSvg(iconType, color, size, opacity = 1, borderWidth) {
@@ -434,7 +1094,9 @@ async function resolveImageToExport(projectDir, imageValue, destinationDir, base
   if (lowerValue.startsWith('data:')) {
     const decoded = decodeDataUrl(rawValue);
     if (!decoded) return null;
-    const fileName = `${slugify(baseName)}${extFromMime(decoded.mime)}`;
+    const dataExtension = extFromMime(decoded.mime);
+    if (!dataExtension) return null;
+    const fileName = `${slugify(baseName)}${dataExtension}`;
     await fs.writeFile(path.join(destinationDir, fileName), decoded.buffer);
     return fileName;
   }
@@ -451,7 +1113,8 @@ async function resolveImageToExport(projectDir, imageValue, destinationDir, base
   if (!sourceAbs || !(await pathExists(sourceAbs))) return null;
 
   const ext = path.extname(sourceAbs).toLowerCase() || '.jpg';
-  const fileName = `${slugify(baseName)}${ext}`;
+  const outputStem = slugify(baseName);
+  const fileName = `${outputStem}${ext}`;
   const outPath = path.join(destinationDir, fileName);
 
   if (!dims || (ext !== '.jpg' && ext !== '.jpeg' && ext !== '.png' && ext !== '.webp')) {
@@ -459,29 +1122,63 @@ async function resolveImageToExport(projectDir, imageValue, destinationDir, base
     return fileName;
   }
 
-  const img = nativeImage.createFromPath(sourceAbs);
-  const size = img.getSize();
-  if (!size.width || !size.height) {
+  if (sharp) {
+    try {
+      const image = sharp(sourceAbs, { failOn: 'none' })
+        .rotate()
+        .resize({
+          width: dims.max,
+          height: dims.max,
+          fit: 'inside',
+          withoutEnlargement: true,
+        });
+      if (ext === '.png') await image.png().toFile(outPath);
+      else if (ext === '.webp') await image.webp({ quality: dims.quality }).toFile(outPath);
+      else await image.jpeg({ quality: dims.quality, mozjpeg: true }).toFile(outPath);
+      return fileName;
+    } catch (error) {
+      try { await fs.rm(outPath, { force: true }); } catch {}
+      await logLine(`sharp export optimization failed for ${sourceAbs}: ${String(error?.message || error)}`);
+    }
+  }
+
+  const fallbackExtension = ext === '.png' ? '.png' : '.jpg';
+  const fallbackFileName = `${outputStem}${fallbackExtension}`;
+  const fallbackOutPath = path.join(destinationDir, fallbackFileName);
+  try {
+    const img = nativeImage.createFromPath(sourceAbs);
+    const size = img.getSize();
+    if (!size.width || !size.height) {
+      await fs.copyFile(sourceAbs, outPath);
+      return fileName;
+    }
+
+    const scale = Math.min(1, dims.max / Math.max(size.width, size.height));
+    const resized = img.resize({
+      width: Math.max(1, Math.round(size.width * scale)),
+      height: Math.max(1, Math.round(size.height * scale)),
+      quality: 'best',
+    });
+
+    if (fallbackExtension === '.png') {
+      await fs.writeFile(fallbackOutPath, resized.toPNG());
+    } else {
+      await fs.writeFile(fallbackOutPath, resized.toJPEG(dims.quality));
+    }
+    return fallbackFileName;
+  } catch (error) {
+    try { await fs.rm(fallbackOutPath, { force: true }); } catch {}
+    await logLine(`native export optimization failed for ${sourceAbs}: ${String(error?.message || error)}`);
     await fs.copyFile(sourceAbs, outPath);
     return fileName;
   }
-
-  const scale = Math.min(1, dims.max / Math.max(size.width, size.height));
-  const resized = img.resize({ width: Math.round(size.width * scale), height: Math.round(size.height * scale), quality: 'best' });
-
-  if (ext === '.png') {
-    await fs.writeFile(outPath, resized.toPNG());
-  } else {
-    await fs.writeFile(outPath, resized.toJPEG(dims.quality));
-  }
-  return fileName;
 }
 
 function safeExportImageValue(copiedRelativePath, originalValue, fallbackValue = '') {
   if (typeof copiedRelativePath === 'string' && copiedRelativePath.length > 0) return copiedRelativePath;
   if (typeof originalValue !== 'string' || originalValue.length === 0) return fallbackValue;
   const lower = originalValue.toLowerCase();
-  if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('data:')) {
+  if (lower.startsWith('http://') || lower.startsWith('https://') || isSupportedImageDataUrl(originalValue)) {
     return originalValue;
   }
   return fallbackValue;
@@ -721,6 +1418,99 @@ async function writeZipFromFolder(sourceDir, outputZip) {
   });
 }
 
+async function replaceStagedPathsAtomically(replacements) {
+  const committed = [];
+  try {
+    for (const replacement of replacements) {
+      const targetPath = path.resolve(replacement.targetPath);
+      if (replacement.removeTarget) {
+        if (!(await pathExists(targetPath))) continue;
+        const backupPath = siblingWorkPath(targetPath, 'backup');
+        await fs.rename(targetPath, backupPath);
+        committed.push({ targetPath, backupPath, hadOriginal: true, removeTarget: true });
+        continue;
+      }
+
+      const stagedPath = path.resolve(replacement.stagedPath);
+      if (path.dirname(stagedPath) !== path.dirname(targetPath)) {
+        throw new Error(`Staged export must be beside its destination: ${targetPath}`);
+      }
+      if (!(await pathExists(stagedPath))) {
+        throw new Error(`Staged export is missing: ${stagedPath}`);
+      }
+
+      const backupPath = siblingWorkPath(targetPath, 'backup');
+      const hadOriginal = await pathExists(targetPath);
+      if (hadOriginal) await fs.rename(targetPath, backupPath);
+
+      try {
+        await fs.rename(stagedPath, targetPath);
+      } catch (error) {
+        if (hadOriginal) {
+          try {
+            await fs.rename(backupPath, targetPath);
+          } catch (restoreError) {
+            throw new Error(
+              `Could not publish ${targetPath}, and its previous version could not be restored. `
+              + `The backup remains at ${backupPath}. ${String(restoreError?.message || restoreError)}`,
+              { cause: error },
+            );
+          }
+        }
+        throw error;
+      }
+
+      committed.push({ targetPath, backupPath, hadOriginal });
+    }
+  } catch (error) {
+    const rollbackErrors = [];
+    for (let index = committed.length - 1; index >= 0; index -= 1) {
+      const item = committed[index];
+      try {
+        if (!item.removeTarget) {
+          await fs.rm(item.targetPath, { recursive: true, force: true });
+        }
+        if (item.hadOriginal) await fs.rename(item.backupPath, item.targetPath);
+      } catch (rollbackError) {
+        rollbackErrors.push(`${item.targetPath}: ${String(rollbackError?.message || rollbackError)}`);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new Error(
+        `${String(error?.message || error)}\nRollback also failed; backup files were retained:\n${rollbackErrors.join('\n')}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+
+  await Promise.all(committed
+    .filter((item) => item.hadOriginal)
+    .map(async (item) => {
+      try {
+        await fs.rm(item.backupPath, { recursive: true, force: true });
+      } catch (error) {
+        await logLine(`Unable to remove export backup ${item.backupPath}: ${String(error?.message || error)}`);
+      }
+    }));
+}
+
+async function writeZipAtomically(sourceDir, outputZip) {
+  const targetPath = path.resolve(outputZip);
+  await ensureDir(path.dirname(targetPath));
+  if (await pathExists(targetPath)) {
+    const targetStat = await fs.stat(targetPath);
+    if (!targetStat.isFile()) throw new Error(`The selected ZIP destination is not a file: ${targetPath}`);
+  }
+  const stagedPath = siblingWorkPath(targetPath, 'staging');
+  try {
+    await writeZipFromFolder(sourceDir, stagedPath);
+    await replaceStagedPathsAtomically([{ stagedPath, targetPath }]);
+  } finally {
+    try { await fs.rm(stagedPath, { force: true }); } catch {}
+  }
+}
+
 function contentTypeFor(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === '.html') return 'text/html; charset=utf-8';
@@ -730,6 +1520,8 @@ function contentTypeFor(filePath) {
   if (ext === '.png') return 'image/png';
   if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
   if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.avif') return 'image/avif';
   if (ext === '.svg') return 'image/svg+xml';
   return 'application/octet-stream';
 }
@@ -761,7 +1553,13 @@ async function startStaticServer(rootDir) {
         res.writeHead(404); res.end('Not found'); return;
       }
 
-      res.writeHead(200, { 'Content-Type': contentTypeFor(targetPath) });
+      const contentType = contentTypeFor(targetPath);
+      // Preview content is regenerated into a fresh server per preview, so images can
+      // be cached; this lets the preloaded panorama be reused by the viewer.
+      const cacheable = contentType.startsWith('image/');
+      res.writeHead(200, cacheable
+        ? { 'Content-Type': contentType, 'Cache-Control': 'private, max-age=600' }
+        : { 'Content-Type': contentType });
       const stream = fsSync.createReadStream(targetPath);
       stream.on('error', () => { res.destroy(); });
       stream.pipe(res);
@@ -769,7 +1567,22 @@ async function startStaticServer(rootDir) {
       res.writeHead(500); res.end('Server error');
     }
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await new Promise((resolve, reject) => {
+      const onError = (error) => reject(error);
+      server.once('error', onError);
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', onError);
+        resolve();
+      });
+    });
+  } catch (error) {
+    try { server.close(); } catch {}
+    throw error;
+  }
+  server.on('error', (error) => {
+    void logLine(`Preview server error: ${String(error?.message || error)}`);
+  });
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
   return { server, url: `http://127.0.0.1:${port}/` };
@@ -783,6 +1596,7 @@ function closeHttpServer(server) {
     }
     try {
       server.close(() => resolve());
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     } catch {
       resolve();
     }
@@ -791,13 +1605,28 @@ function closeHttpServer(server) {
 
 async function cleanupPreviewInstance(instance) {
   if (!instance) return;
-  await closeHttpServer(instance.server);
-  const tempRoot = instance.tempRoot || instance.root;
-  if (!tempRoot) return;
-  try {
-    await fs.rm(tempRoot, { recursive: true, force: true });
-  } catch {
-  }
+  if (instance.cleanupPromise) return instance.cleanupPromise;
+  // Defer the cleanup body one microtask so the promise is assigned before a
+  // BrowserWindow 'closed' event can recursively ask to clean the same item.
+  instance.cleanupPromise = Promise.resolve().then(async () => {
+    const previewWindow = instance.window;
+    instance.window = null;
+    if (previewWindow && !previewWindow.isDestroyed()) {
+      try { previewWindow.destroy(); } catch {}
+    }
+
+    const server = instance.server;
+    instance.server = null;
+    await closeHttpServer(server);
+
+    const tempRoot = instance.tempRoot || instance.root;
+    if (!tempRoot) return;
+    try {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    } catch {
+    }
+  });
+  return instance.cleanupPromise;
 }
 
 async function runProjectHealthCheck(project, exportOptions) {
@@ -806,7 +1635,17 @@ async function runProjectHealthCheck(project, exportOptions) {
   if (!project?.name) issues.push('Project name is empty.');
   if (!project?.scenes?.length) issues.push('No scenes found in this project.');
 
-  const sceneIds = new Set((project.scenes || []).map((s) => s.id));
+  const sceneIds = new Set();
+  for (const scene of (project.scenes || [])) {
+    const sceneId = String(scene?.id || '').trim();
+    if (!sceneId) {
+      issues.push(`Scene '${scene?.name || 'Untitled Scene'}' has no ID.`);
+    } else if (sceneIds.has(sceneId)) {
+      issues.push(`Duplicate scene ID '${sceneId}' must be repaired before export.`);
+    } else {
+      sceneIds.add(sceneId);
+    }
+  }
   const projectDir = getProjectDir(project);
   const validateAssetPath = async (assetLabel, assetValue, { allowRemote = true, missingAsIssue = true } = {}) => {
     const raw = String(assetValue || '').trim();
@@ -855,9 +1694,35 @@ async function runProjectHealthCheck(project, exportOptions) {
     if (scene.thumbnail) {
       await validateAssetPath(`Scene '${scene.name}' thumbnail`, scene.thumbnail, { allowRemote: true, missingAsIssue: false });
     }
+    const objectIds = new Set();
     for (const hotspot of (scene.hotspots || [])) {
-      if (!sceneIds.has(hotspot.targetSceneId)) {
+      const hotspotId = String(hotspot?.id || '').trim();
+      if (!hotspotId) {
+        issues.push(`A hotspot in '${scene.name}' has no ID.`);
+      } else if (objectIds.has(hotspotId)) {
+        issues.push(`Duplicate object ID '${hotspotId}' in scene '${scene.name}'.`);
+      } else {
+        objectIds.add(hotspotId);
+      }
+      if (!sceneIds.has(String(hotspot?.targetSceneId || '').trim())) {
         issues.push(`Hotspot '${hotspot.label}' in '${scene.name}' points to missing target scene.`);
+      }
+    }
+    for (const marker of (scene.markers || [])) {
+      const markerId = String(marker?.id || '').trim();
+      if (!markerId) {
+        issues.push(`A marker in '${scene.name}' has no ID.`);
+      } else if (objectIds.has(markerId)) {
+        issues.push(`Duplicate object ID '${markerId}' in scene '${scene.name}'.`);
+      } else {
+        objectIds.add(markerId);
+      }
+      if (marker.image) {
+        await validateAssetPath(
+          `Marker '${marker.title || 'Info'}' image in '${scene.name}'`,
+          marker.image,
+          { allowRemote: true, missingAsIssue: false },
+        );
       }
     }
     if ((scene.hotspots || []).length === 0) {
@@ -867,6 +1732,7 @@ async function runProjectHealthCheck(project, exportOptions) {
 
   const includeBranding = exportOptions?.includeBranding ?? project.exportSettings?.includeBranding;
   const includeFloorPlan = exportOptions?.includeFloorPlan ?? project.exportSettings?.showFloorPlan;
+  const includeGallery = exportOptions?.includeGallery ?? project.exportSettings?.showGallery;
   if (includeBranding && !project.logo) {
     warnings.push('Branding enabled but no logo uploaded.');
   } else if (includeBranding && project.logo) {
@@ -877,6 +1743,12 @@ async function runProjectHealthCheck(project, exportOptions) {
     issues.push('Floor plan export enabled but no floor plan image is set.');
   } else if (includeFloorPlan && project.floorPlanImage) {
     await validateAssetPath('Project floor plan image', project.floorPlanImage, { allowRemote: true, missingAsIssue: false });
+  }
+
+  if (includeGallery) {
+    for (let i = 0; i < (project.galleryImages || []).length; i += 1) {
+      await validateAssetPath(`Gallery image ${i + 1}`, project.galleryImages[i], { allowRemote: true, missingAsIssue: false });
+    }
   }
 
   return { ok: issues.length === 0, issues, warnings };
@@ -927,6 +1799,8 @@ ${exportFolderName}/
     ├── tour.json       ← All tour data: scenes, hotspots, markers, settings. Human-readable JSON.
     ├── panoramas/      ← Equirectangular panorama images (JPEG/WEBP).
     ├── thumbnails/     ← Thumbnail images used in the gallery panel.
+    ├── gallery/        ← Project gallery images (if included).
+    ├── markers/        ← Images attached to information markers.
     ├── logo/           ← Branding logo (if included).
     └── floorplan/      ← Floor plan image (if included).
 \`\`\`
@@ -987,7 +1861,7 @@ python -m http.server 8080
 `;
 }
 
-async function performExport(project, options, targetBaseDir) {
+async function performExport(project, options, targetBaseDir, destination = {}) {
   const effectiveOptions = {
     includeBranding: options?.includeBranding ?? project?.exportSettings?.includeBranding ?? true,
     includeFloorPlan: options?.includeFloorPlan ?? project?.exportSettings?.showFloorPlan ?? false,
@@ -1000,22 +1874,49 @@ async function performExport(project, options, targetBaseDir) {
   };
 
   const projectDir = await ensureProjectScaffold(project);
-  const exportFolderName = `panoradesk360-${slugify(project.name)}`;
-  const exportDir = path.join(targetBaseDir, exportFolderName);
+  // Local ZIP/preview exports keep the readable, name-based folder. Only the
+  // website deploy passes an immutable, ID-derived publicFolderName.
+  const exportFolderName = destination.publicFolderName || `panoradesk360-${slugify(project.name || 'tour')}`;
+  const exportDir = destination.exportDir
+    ? path.resolve(destination.exportDir)
+    : path.join(targetBaseDir, exportFolderName);
+
+  // Deploying the same tour again must not leave images from an older export
+  // behind. Apart from bloating the upload, those files can expose gallery or
+  // panorama assets the author has since removed. Only clear directories that
+  // PanoraDesk owns inside the generated export folder; leave any unrelated
+  // files alongside the generated tour untouched.
+  if (!isWithinDir(targetBaseDir, exportDir) || path.resolve(targetBaseDir) === path.resolve(exportDir)) {
+    throw new Error('Refusing to export outside the selected destination.');
+  }
+  const generatedAssetDirs = [
+    path.join(exportDir, 'assets', 'panoramas'),
+    path.join(exportDir, 'assets', 'thumbnails'),
+    path.join(exportDir, 'assets', 'gallery'),
+    path.join(exportDir, 'assets', 'markers'),
+    path.join(exportDir, 'assets', 'logo'),
+    path.join(exportDir, 'assets', 'floorplan'),
+  ];
+  await Promise.all(generatedAssetDirs.map((dir) => fs.rm(dir, { recursive: true, force: true })));
 
   const assetsDir = path.join(exportDir, 'assets');
   const panoramasDir = path.join(assetsDir, 'panoramas');
   const thumbnailsDir = path.join(assetsDir, 'thumbnails');
+  const galleryDir = path.join(assetsDir, 'gallery');
+  const markersDir = path.join(assetsDir, 'markers');
   const logoDir = path.join(assetsDir, 'logo');
   const floorplanDir = path.join(assetsDir, 'floorplan');
 
   await ensureDir(panoramasDir);
   await ensureDir(thumbnailsDir);
+  await ensureDir(galleryDir);
+  await ensureDir(markersDir);
   await ensureDir(logoDir);
   await ensureDir(floorplanDir);
 
   const sceneImageMap = new Map();
   const sceneThumbMap = new Map();
+  const markerImageMap = new Map();
 
   for (let i = 0; i < (project.scenes || []).length; i += 1) {
     const scene = project.scenes[i];
@@ -1034,18 +1935,56 @@ async function performExport(project, options, targetBaseDir) {
     );
     sceneImageMap.set(scene.id, exportedPano);
     sceneThumbMap.set(scene.id, exportedThumb);
+
+    for (let markerIndex = 0; markerIndex < (scene.markers || []).length; markerIndex += 1) {
+      const marker = scene.markers[markerIndex];
+      if (!marker?.image) continue;
+      const markerFile = await resolveImageToExport(
+        projectDir,
+        marker.image,
+        markersDir,
+        `${base}-marker-${String(markerIndex + 1).padStart(2, '0')}-${marker.title || 'info'}`,
+        effectiveOptions.imageOptimization || 'none',
+      );
+      const exportedMarkerImage = safeExportImageValue(
+        markerFile ? `assets/markers/${markerFile}` : '',
+        marker.image,
+        '',
+      );
+      markerImageMap.set(`${scene.id}:${markerIndex}`, exportedMarkerImage || undefined);
+    }
+  }
+
+  const exportGalleryImages = [];
+  if (effectiveOptions.includeGallery) {
+    for (let i = 0; i < (project.galleryImages || []).length; i += 1) {
+      const original = project.galleryImages[i];
+      const galleryFile = await resolveImageToExport(
+        projectDir,
+        original,
+        galleryDir,
+        `gallery-${String(i + 1).padStart(2, '0')}`,
+        effectiveOptions.imageOptimization || 'none',
+      );
+      const exported = safeExportImageValue(
+        galleryFile ? `assets/gallery/${galleryFile}` : '',
+        original,
+        '',
+      );
+      if (exported) exportGalleryImages.push(exported);
+    }
   }
 
   let exportLogo = null;
   if (project.logo && effectiveOptions.includeBranding) {
     const logoFile = await resolveImageToExport(projectDir, project.logo, logoDir, 'logo', 'none');
-    if (logoFile) exportLogo = `assets/logo/${logoFile}`;
+    exportLogo = safeExportImageValue(logoFile ? `assets/logo/${logoFile}` : '', project.logo, null);
   }
 
   let exportFloorplan = null;
   if (project.floorPlanImage && effectiveOptions.includeFloorPlan) {
     const floorFile = await resolveImageToExport(projectDir, project.floorPlanImage, floorplanDir, 'floorplan', effectiveOptions.imageOptimization || 'none');
-    if (floorFile) exportFloorplan = `assets/floorplan/${floorFile}`;
+    exportFloorplan = safeExportImageValue(floorFile ? `assets/floorplan/${floorFile}` : '', project.floorPlanImage, null);
   }
 
   const exportProject = {
@@ -1054,6 +1993,7 @@ async function performExport(project, options, targetBaseDir) {
     path: undefined,
     logo: exportLogo,
     floorPlanImage: exportFloorplan,
+    galleryImages: exportGalleryImages,
     exportSettings: {
       ...project.exportSettings,
       includeBranding: !!effectiveOptions.includeBranding,
@@ -1077,8 +2017,9 @@ async function performExport(project, options, targetBaseDir) {
           h.borderWidth ?? project.hotspotStyle?.borderWidth ?? 4,
         ),
       })),
-      markers: (scene.markers || []).map((m) => ({
+      markers: (scene.markers || []).map((m, markerIndex) => ({
         ...m,
+        image: markerImageMap.get(`${scene.id}:${markerIndex}`),
         iconData: hotspotIconDataUri('info', '#3b82f6', 30, 0.95),
       })),
     })),
@@ -1088,6 +2029,17 @@ async function performExport(project, options, targetBaseDir) {
   await fs.writeFile(path.join(exportDir, 'README.md'), generateReadme(project, exportFolderName, effectiveOptions), 'utf-8');
   await fs.writeFile(path.join(assetsDir, 'style.css'), generateExportStyle(effectiveOptions.template), 'utf-8');
   await fs.writeFile(path.join(assetsDir, 'tour.json'), JSON.stringify(exportProject, null, 2), 'utf-8');
+  await fs.writeFile(
+    path.join(exportDir, TOUR_OWNERSHIP_MANIFEST),
+    JSON.stringify({
+      format: 'panoradesk-360-tour',
+      version: 1,
+      projectId: exportProjectId(project),
+      projectName: String(project.name || 'Untitled Tour'),
+      exportedAt: new Date().toISOString(),
+    }, null, 2),
+    'utf-8',
+  );
 
   // Copy self-contained vendor bundle (PSV + Three.js + compiled player) so the tour works offline
   const vendorSrc = path.join(__dirname, 'vendor');
@@ -1097,7 +2049,7 @@ async function performExport(project, options, targetBaseDir) {
     try {
       await fs.copyFile(path.join(vendorSrc, file), path.join(vendorDst, file));
     } catch {
-      // vendor files missing — export still works via CDN fallback
+      throw new Error(`Missing shared runtime: electron/vendor/${file}. Run vendor bundle before exporting.`);
     }
   }
   // player.js is compiled from src/export/player.ts by bundle-vendor.mjs
@@ -1110,7 +2062,7 @@ async function performExport(project, options, targetBaseDir) {
   let zipPath = null;
   if (effectiveOptions.zipOutput) {
     zipPath = path.join(targetBaseDir, `${exportFolderName}.zip`);
-    await writeZipFromFolder(exportDir, zipPath);
+    await writeZipAtomically(exportDir, zipPath);
   }
 
   return {
@@ -1149,7 +2101,7 @@ function escapeJsString(value) {
   return JSON.stringify(String(value ?? '')).slice(1, -1).replace(/</g, '\\u003C');
 }
 
-function buildTourPageHtml(tourId, title) {
+function buildTourPageHtml(tourId, title, tourPath, projectHash) {
   const safeTitle = escapeHtml(title || 'Virtual Tour');
   return `<!doctype html>
 <html lang="en">
@@ -1157,6 +2109,7 @@ function buildTourPageHtml(tourId, title) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex, nofollow">
+  <meta name="panoradesk-project-key" content="${escapeHtml(projectHash)}">
   <title>${safeTitle} | Virtual Tour</title>
   <link rel="icon" href="favicon.png" type="image/png" sizes="32x32">
   <style>
@@ -1195,68 +2148,423 @@ function buildTourPageHtml(tourId, title) {
   <iframe id="tour-iframe" allow="xr-spatial-tracking;gyroscope;accelerometer;fullscreen" scrolling="no"></iframe>
   <script src="assets/js/tour-pages.js"></script>
   <script>
-    window.TourPages.mountPage({ tourId: "${escapeJsString(tourId)}" });
+    (function () {
+      var directSrc = "${escapeJsString(tourPath)}";
+      if (window.TourPages && typeof window.TourPages.mountPage === "function") {
+        window.TourPages.mountPage({ tourId: "${escapeJsString(tourId)}" });
+        return;
+      }
+      var frame = document.getElementById("tour-iframe");
+      var loader = document.getElementById("tour-loader");
+      var openLink = document.getElementById("tour-open-link");
+      if (openLink) openLink.href = directSrc;
+      if (!frame) return;
+      frame.addEventListener("load", function () {
+        frame.classList.add("ready");
+        if (loader) loader.style.display = "none";
+      }, { once: true });
+      frame.src = directSrc;
+    })();
   </script>
 </body>
 </html>`;
 }
 
-async function updateTourPagesJs(websiteDir, tourId, title, slug, tourPath) {
-  const jsFile = path.join(websiteDir, 'assets', 'js', 'tour-pages.js');
-  let content = await fs.readFile(jsFile, 'utf-8');
+function findMatchingJsBrace(source, openIndex) {
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = openIndex; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
 
+function findTourMapEntry(source, tourId) {
+  const mapDeclaration = /const\s+TOUR_MAP\s*=\s*\{/.exec(source);
+  if (!mapDeclaration) return null;
+  const mapOpen = source.indexOf('{', mapDeclaration.index);
+  const mapClose = findMatchingJsBrace(source, mapOpen);
+  if (mapOpen < 0 || mapClose < 0) return null;
+
+  const escapedTourId = tourId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mapBody = source.slice(mapOpen + 1, mapClose);
+  const keyMatch = new RegExp(
+    `^[\\t ]*(?:["']${escapedTourId}["']|${escapedTourId})\\s*:\\s*\\{`,
+    'm',
+  ).exec(mapBody);
+  if (!keyMatch) return { mapOpen, mapClose, entry: null };
+
+  const entryStart = mapOpen + 1 + keyMatch.index;
+  const entryOpen = entryStart + keyMatch[0].lastIndexOf('{');
+  const entryClose = findMatchingJsBrace(source, entryOpen);
+  if (entryClose < 0 || entryClose > mapClose) return null;
+  let entryEnd = entryClose + 1;
+  while (source[entryEnd] === ' ' || source[entryEnd] === '\t') entryEnd += 1;
+  const hasTrailingComma = source[entryEnd] === ',';
+  if (hasTrailingComma) entryEnd += 1;
+  return {
+    mapOpen,
+    mapClose,
+    entry: {
+      start: entryStart,
+      end: entryEnd,
+      hasTrailingComma,
+      source: source.slice(entryStart, entryClose + 1),
+    },
+  };
+}
+
+function removeOwnedTourMapEntry(source, tourId, expectedTourPath) {
+  const match = findTourMapEntry(source, tourId);
+  if (!match) {
+    throw new Error('The TOUR_MAP in assets/js/tour-pages.js is malformed. The website was left unchanged.');
+  }
+  if (!match.entry) return source;
+
+  const quotedPath = `"${escapeJsString(expectedTourPath)}"`;
+  if (!match.entry.source.includes(quotedPath)) {
+    throw new Error(`The existing ${tourId} website entry does not belong to the matching PanoraDesk tour. The website was left unchanged.`);
+  }
+  return `${source.slice(0, match.entry.start)}${source.slice(match.entry.end)}`;
+}
+
+function buildUpdatedTourPagesJs(source, tourId, title, slug, tourPath, obsoleteEntries = []) {
+  let content = source;
+  for (const obsolete of obsoleteEntries) {
+    if (obsolete.tourId === tourId) continue;
+    content = removeOwnedTourMapEntry(content, obsolete.tourId, obsolete.tourPath);
+  }
   // Every field is a user-controlled project name — quote them all properly
   // instead of only escaping apostrophes.
   const entry = `    "${escapeJsString(tourId)}": {\n      title: "${escapeJsString(title)}",\n      slug: "${escapeJsString(slug)}",\n      liveSrc: "${escapeJsString(tourPath)}",\n      localSrc: "${escapeJsString(tourPath)}"\n    }`;
 
-  // Replace existing entry if present (older builds wrote single-quoted keys).
-  const existing = new RegExp(`\\s*['"]?${tourId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]?:\\s*\\{[^}]+\\},?`, 'g');
-  existing.lastIndex = 0;
-  if (existing.test(content)) {
-    existing.lastIndex = 0;
-    content = content.replace(existing, `\n${entry}`);
+  const mapMatch = findTourMapEntry(content, tourId);
+  if (!mapMatch) {
+    throw new Error('Could not find the TOUR_MAP in assets/js/tour-pages.js. The website was left unchanged.');
+  }
+  const { mapOpen, mapClose } = mapMatch;
+
+  // Find the property by its key, then use a string/comment-aware brace scan
+  // for its value. A title containing `}` must not terminate the match early.
+  const mapBody = content.slice(mapOpen + 1, mapClose);
+  if (mapMatch.entry) {
+    const trailingComma = mapMatch.entry.hasTrailingComma ? ',' : '';
+    content = `${content.slice(0, mapMatch.entry.start)}${entry}${trailingComma}${content.slice(mapMatch.entry.end)}`;
   } else {
-    // Insert before the closing }; of TOUR_MAP
-    content = content.replace(/(\s*};[\s\n]*function\s+isLocalHost)/, `,\n${entry}\n  $1`);
+    // Insert into TOUR_MAP without assuming it already has an entry. Adding a
+    // leading comma to an empty object produces invalid JavaScript.
+    const existingBody = mapBody.replace(/\s*$/, '');
+    const separator = existingBody.trim() && !existingBody.trimEnd().endsWith(',') ? ',' : '';
+    const nextBody = existingBody.trim()
+      ? `${existingBody}${separator}\n${entry}\n  `
+      : `\n${entry}\n  `;
+    content = `${content.slice(0, mapOpen + 1)}${nextBody}${content.slice(mapClose)}`;
+  }
+  return content;
+}
+
+function tourMapHasEntry(content, tourId) {
+  const escapedId = tourId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[,\\s{])['"]?${escapedId}['"]?\\s*:`, 'm').test(content);
+}
+
+async function tourOwnerProjectId(tourDir) {
+  try {
+    const manifest = JSON.parse(await fs.readFile(path.join(tourDir, TOUR_OWNERSHIP_MANIFEST), 'utf-8'));
+    if (manifest?.format === 'panoradesk-360-tour' && typeof manifest?.projectId === 'string') {
+      return manifest.projectId;
+    }
+  } catch {}
+
+  // Exports made before ownership sidecars were introduced still include the
+  // complete project identity in assets/tour.json. Accept only a recognizable
+  // PanoraDesk document; a matching folder name alone never grants deletion.
+  try {
+    const tour = JSON.parse(await fs.readFile(path.join(tourDir, 'assets', 'tour.json'), 'utf-8'));
+    if (isPanoraDeskProjectDocument(tour) && typeof tour.id === 'string' && tour.id) return tour.id;
+  } catch {}
+  return null;
+}
+
+async function pageOwnerProjectHash(pageFile) {
+  try {
+    const content = await fs.readFile(pageFile, 'utf-8');
+    const match = /<meta\s+name=["']panoradesk-project-key["']\s+content=["']([a-f0-9]{64})["']\s*\/?>/i.exec(content);
+    return match ? match[1].toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isOwnedGeneratedTourPage(pageFile, projectHash, tourId) {
+  const knownHash = await pageOwnerProjectHash(pageFile);
+  if (knownHash) return knownHash === projectHash;
+  try {
+    const content = await fs.readFile(pageFile, 'utf-8');
+    const escapedTourId = escapeJsString(tourId);
+    return content.includes('TourPages.mountPage')
+      && (
+        content.includes(`tourId: "${escapedTourId}"`)
+        || content.includes(`tourId: '${escapedTourId}'`)
+      )
+      && content.includes('id="tour-iframe"');
+  } catch {
+    return false;
+  }
+}
+
+async function findObsoleteOwnedWebsiteRoutes(project, websiteDir, toursDir, activeRoute, tourPagesContent) {
+  const projectId = exportProjectId(project);
+  const projectHash = exportProjectHash(project);
+  const obsolete = [];
+  let entries;
+  try {
+    entries = await fs.readdir(toursDir, { withFileTypes: true });
+  } catch {
+    return obsolete;
   }
 
-  await fs.writeFile(jsFile, content, 'utf-8');
+  for (const dirEntry of entries) {
+    if (!dirEntry.isDirectory() || !dirEntry.name.startsWith('panoradesk360-')) continue;
+    const tourDir = path.join(toursDir, dirEntry.name);
+    if (projectPathKey(tourDir) === projectPathKey(activeRoute.tourDir)) continue;
+    if ((await tourOwnerProjectId(tourDir)) !== projectId) continue;
+
+    const suffix = dirEntry.name.slice('panoradesk360-'.length);
+    if (!suffix) continue;
+    const tourId = `pd-${suffix}`;
+    const pageSlug = `tour-${suffix}`;
+    const pageFile = path.join(websiteDir, `${pageSlug}.html`);
+    const tourPath = `/assets/tours/${dirEntry.name}/index.html`;
+    const pageExists = await pathExists(pageFile);
+    if (pageExists && !(await isOwnedGeneratedTourPage(pageFile, projectHash, tourId))) {
+      // Keep the entire old route when its expected wrapper was customized or
+      // replaced; deleting only its assets would break unrelated site content.
+      continue;
+    }
+
+    const mapMatch = tourPagesContent ? findTourMapEntry(tourPagesContent, tourId) : null;
+    if (tourPagesContent && !mapMatch) continue;
+    if (mapMatch?.entry) {
+      const quotedPath = `"${escapeJsString(tourPath)}"`;
+      if (!mapMatch.entry.source.includes(quotedPath)) continue;
+    }
+
+    obsolete.push({
+      tourDir,
+      pageFile,
+      pageExists,
+      tourId,
+      tourPath,
+      hasMapEntry: !!mapMatch?.entry,
+    });
+  }
+  return obsolete;
+}
+
+async function resolveWebsiteTourRoute(project, websiteDir, toursDir, tourPagesContent) {
+  const projectId = exportProjectId(project);
+  const projectHash = exportProjectHash(project);
+  for (const hashLength of [16, 32, 64]) {
+    const route = tourRouteParts(project, hashLength);
+    const tourDir = path.join(toursDir, route.folderName);
+    const pageFile = path.join(websiteDir, `${route.pageSlug}.html`);
+    const tourExists = await pathExists(tourDir);
+    const pageExists = await pathExists(pageFile);
+    const knownTourOwner = tourExists ? await tourOwnerProjectId(tourDir) : null;
+    const knownPageOwner = pageExists ? await pageOwnerProjectHash(pageFile) : null;
+    const ownsLegacyPage = pageExists
+      && knownTourOwner === projectId
+      && await isOwnedGeneratedTourPage(pageFile, projectHash, route.tourId);
+
+    if (tourExists && knownTourOwner !== projectId) continue;
+    if (pageExists && knownPageOwner !== projectHash && !ownsLegacyPage) continue;
+    if (tourPagesContent && tourMapHasEntry(tourPagesContent, route.tourId) && !tourExists && !pageExists) continue;
+    return { ...route, tourDir, pageFile, projectHash };
+  }
+  throw new Error('A different tour already owns every deterministic route for this project. The website was left unchanged.');
 }
 
 async function deployToWebsite(project, options, websiteDir) {
-  // Validate that this looks like the website root, not a subfolder
-  const tourPagesFile = path.join(websiteDir, 'assets', 'js', 'tour-pages.js');
-  const hasIndexHtml = await fs.access(path.join(websiteDir, 'index.html')).then(() => true).catch(() => false);
-  const hasTourPages = await fs.access(tourPagesFile).then(() => true).catch(() => false);
-  if (!hasIndexHtml && !hasTourPages) {
-    throw new Error(
-      `The selected folder doesn't look like the website root.\n\nPlease select the root of your website (the folder that contains index.html and the assets/ folder).\n\nSelected: ${websiteDir}`
+  return enqueueWebsiteDeploy(websiteDir, async () => {
+    // Validate that this looks like the website root, not a subfolder.
+    const tourPagesFile = path.join(websiteDir, 'assets', 'js', 'tour-pages.js');
+    const hasIndexHtml = await fs.access(path.join(websiteDir, 'index.html')).then(() => true).catch(() => false);
+    const hasTourPages = await fs.access(tourPagesFile).then(() => true).catch(() => false);
+    if (!hasIndexHtml && !hasTourPages) {
+      throw new Error(
+        `The selected folder doesn't look like the website root.\n\nPlease select the root of your website (the folder that contains index.html and the assets/ folder).\n\nSelected: ${websiteDir}`
+      );
+    }
+
+    const toursDir = path.join(websiteDir, 'assets', 'tours');
+    await ensureDir(toursDir);
+    const tourPagesContent = hasTourPages ? await fs.readFile(tourPagesFile, 'utf-8') : null;
+    const route = await resolveWebsiteTourRoute(project, websiteDir, toursDir, tourPagesContent);
+    const obsoleteRoutes = await findObsoleteOwnedWebsiteRoutes(
+      project,
+      websiteDir,
+      toursDir,
+      route,
+      tourPagesContent,
     );
-  }
+    const tourPath = `/assets/tours/${route.folderName}/index.html`;
+    const stagedTourDir = siblingWorkPath(route.tourDir, 'staging');
+    const stagedPageFile = siblingWorkPath(route.pageFile, 'staging');
+    const stagedTourPagesFile = hasTourPages ? siblingWorkPath(tourPagesFile, 'staging') : null;
 
-  const toursDir = path.join(websiteDir, 'assets', 'tours');
-  await ensureDir(toursDir);
+    let redirectsToClean = [];
+    try {
+      await performExport(
+        project,
+        { ...options, zipOutput: false },
+        toursDir,
+        { exportDir: stagedTourDir, publicFolderName: route.folderName },
+      );
 
-  const exported = await performExport(project, { ...options, zipOutput: false }, toursDir);
+      if (hasTourPages) {
+        const nextTourPages = buildUpdatedTourPagesJs(
+          tourPagesContent,
+          route.tourId,
+          project.name,
+          route.pageSlug,
+          tourPath,
+          obsoleteRoutes.filter((obsolete) => obsolete.hasMapEntry),
+        );
+        await fs.writeFile(stagedTourPagesFile, nextTourPages, 'utf-8');
+      }
+      await fs.writeFile(
+        stagedPageFile,
+        buildTourPageHtml(route.tourId, project.name, tourPath, route.projectHash),
+        'utf-8',
+      );
 
-  const tourSlug = slugify(project.name);
-  const tourId = `pd-${tourSlug}`;
-  const pageSlug = `tour-${tourSlug}`;
-  const tourPath = `/assets/tours/${exported.folderName}/index.html`;
+      const stagedRedirects = [];
+      redirectsToClean = stagedRedirects;
+      const replacements = [{ stagedPath: stagedTourDir, targetPath: route.tourDir }];
+      if (hasTourPages) replacements.push({ stagedPath: stagedTourPagesFile, targetPath: tourPagesFile });
+      replacements.push({ stagedPath: stagedPageFile, targetPath: route.pageFile });
+      for (const obsolete of obsoleteRoutes) {
+        replacements.push({ targetPath: obsolete.tourDir, removeTarget: true });
+        if (obsolete.pageExists) {
+          // Leave a redirect at the old public URL so existing links keep working.
+          const stagedRedirect = siblingWorkPath(obsolete.pageFile, 'staging');
+          stagedRedirects.push(stagedRedirect);
+          const newPage = `${route.pageSlug}.html`;
+          await fs.writeFile(
+            stagedRedirect,
+            `<!doctype html>\n<html lang="en"><head><meta charset="UTF-8">`
+            + `<meta name="robots" content="noindex, nofollow">`
+            + `<meta http-equiv="refresh" content="0; url=${escapeHtml(newPage)}">`
+            + `<link rel="canonical" href="${escapeHtml(newPage)}"><title>Redirecting…</title></head>`
+            + `<body><a href="${escapeHtml(newPage)}">Continue to the virtual tour</a></body></html>`,
+            'utf-8',
+          );
+          replacements.push({ stagedPath: stagedRedirect, targetPath: obsolete.pageFile });
+        }
+      }
+      await replaceStagedPathsAtomically(replacements);
 
-  if (hasTourPages) {
-    await updateTourPagesJs(websiteDir, tourId, project.name, pageSlug, tourPath);
-  }
+      return {
+        exportDir: route.tourDir,
+        tourId: route.tourId,
+        tourPath,
+        pageFile: `${route.pageSlug}.html`,
+      };
+    } finally {
+      try { await fs.rm(stagedTourDir, { recursive: true, force: true }); } catch {}
+      try { await fs.rm(stagedPageFile, { force: true }); } catch {}
+      for (const staged of redirectsToClean) {
+        try { await fs.rm(staged, { force: true }); } catch {}
+      }
+      if (stagedTourPagesFile) {
+        try { await fs.rm(stagedTourPagesFile, { force: true }); } catch {}
+      }
+    }
+  });
+}
 
-  const pageFile = path.join(websiteDir, `${pageSlug}.html`);
-  await fs.writeFile(pageFile, buildTourPageHtml(tourId, project.name), 'utf-8');
+function openExternalHttpUrl(url) {
+  if (!/^https?:\/\//i.test(String(url || ''))) return;
+  void shell.openExternal(url).catch(() => {});
+}
 
-  return { exportDir: exported.exportDir, tourId, tourPath, pageFile: `${pageSlug}.html` };
+function guardPreviewWindowNavigation(previewWindow, previewUrl) {
+  const previewOrigin = new URL(previewUrl).origin;
+  const isPreviewUrl = (candidate) => {
+    try {
+      const parsed = new URL(candidate);
+      return parsed.origin === previewOrigin && /^https?:$/.test(parsed.protocol);
+    } catch {
+      return false;
+    }
+  };
+  const preventExternalNavigation = (event, url) => {
+    if (isPreviewUrl(url)) return;
+    event.preventDefault();
+    openExternalHttpUrl(url);
+  };
+
+  previewWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalHttpUrl(url);
+    return { action: 'deny' };
+  });
+  previewWindow.webContents.on('will-navigate', preventExternalNavigation);
+  previewWindow.webContents.on('will-redirect', preventExternalNavigation);
 }
 
 async function createWindow() {
   await logLine('createWindow:start');
-  const appVersion = app.getVersion();
+  // Build number (local date/time) is stamped by vite.config.ts at build time.
+  let buildLabel = `v${app.getVersion()}`;
+  try {
+    const info = JSON.parse(fsSync.readFileSync(path.join(__dirname, 'build-info.json'), 'utf-8'));
+    if (info?.buildNumber) buildLabel = `Build ${info.buildNumber}`;
+  } catch {}
   const win = new BrowserWindow({
     width: 1600,
     height: 980,
@@ -1274,9 +2582,16 @@ async function createWindow() {
     },
   });
 
-  win.setTitle(`PanoraDesk 360 v${appVersion}`);
+  win.setTitle(`PanoraDesk 360 · ${buildLabel}`);
+  // Keep the build number in the title; otherwise index.html's <title> replaces it.
+  win.on('page-title-updated', (event) => event.preventDefault());
   mainWindow = win;
   allowAppClose = false;
+  pendingCloseRequestId = null;
+  if (appCloseFallbackTimer) {
+    clearTimeout(appCloseFallbackTimer);
+    appCloseFallbackTimer = null;
+  }
 
   // Open external links in the system browser instead of navigating the app
   // window away or spawning an in-app Electron window.
@@ -1291,20 +2606,39 @@ async function createWindow() {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {});
   });
 
-  // Give the renderer a chance to flush a pending autosave before the window
-  // actually closes. The renderer answers via the 'app:confirm-close' IPC.
+  // Give the renderer a bounded chance to flush pending autosaves. A timeout
+  // cancels this close attempt instead of discarding data; late responses are
+  // ignored through the request ID.
   win.on('close', (event) => {
     if (allowAppClose) return;
     event.preventDefault();
-    try { win.webContents.send('app:flush-before-close'); } catch {}
-    if (!appCloseFallbackTimer) {
-      appCloseFallbackTimer = setTimeout(() => {
-        // Clear the handle, otherwise a later close attempt sees a stale
-        // truthy timer and never schedules its own fallback.
-        appCloseFallbackTimer = null;
-        allowAppClose = true;
-        if (win && !win.isDestroyed()) win.close();
-      }, 3000);
+    if (pendingCloseRequestId !== null) return;
+
+    const requestId = String(++closeRequestSequence);
+    pendingCloseRequestId = requestId;
+    appCloseFallbackTimer = setTimeout(() => {
+      if (pendingCloseRequestId !== requestId) return;
+      pendingCloseRequestId = null;
+      appCloseFallbackTimer = null;
+      void logLine(`close flush timed out request=${requestId}`);
+      if (win && !win.isDestroyed()) {
+        void dialog.showMessageBox(win, {
+          type: 'warning',
+          title: 'Project is still saving',
+          message: 'PanoraDesk could not finish saving within 15 seconds.',
+          detail: 'The window was kept open so your changes are not discarded. Check the save error and try closing again.',
+          buttons: ['OK'],
+          defaultId: 0,
+          noLink: true,
+        }).catch(() => {});
+      }
+    }, CLOSE_FLUSH_TIMEOUT_MS);
+    try {
+      win.webContents.send('app:flush-before-close', { requestId });
+    } catch {
+      clearTimeout(appCloseFallbackTimer);
+      appCloseFallbackTimer = null;
+      pendingCloseRequestId = null;
     }
   });
 
@@ -1341,26 +2675,50 @@ async function createWindow() {
 app.whenReady().then(async () => {
   await ensureProjectRoot();
 
-  // app-media://local/<absolute path> — the renderer resolves every project
-  // asset through this so images work identically in dev (http origin) and in
-  // a packaged build (file origin).
+  // Project images work through the same URL in development and packaged
+  // builds. Only validated project asset folders registered by list/open/save
+  // are readable; arbitrary absolute paths are never served by this scheme.
   protocol.handle('app-media', async (request) => {
     try {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return new Response('Method not allowed', { status: 405 });
+      }
       const url = new URL(request.url);
       if (url.hostname && url.hostname !== 'local') {
         return new Response('Not found', { status: 404 });
       }
+      const explicitPath = url.searchParams.get('path');
       const decoded = decodeURIComponent(url.pathname);
-      // Windows absolute paths arrive as /C:/... — drop the leading slash.
-      const raw = /^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded;
+      // Query-based paths preserve UNC and POSIX roots. Continue accepting the
+      // original pathname form so projects opened by older builds still work.
+      const raw = explicitPath ?? (/^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded);
       const filePath = path.normalize(raw);
+      if (!path.isAbsolute(filePath)) {
+        return new Response('Bad request', { status: 400 });
+      }
+      if (!(await isAuthorizedProjectMediaFile(filePath))) {
+        return new Response('Forbidden', { status: 403 });
+      }
       const stat = await fs.stat(filePath).catch(() => null);
       if (!stat || !stat.isFile()) {
         return new Response('Not found', { status: 404 });
       }
       const fileResponse = await net.fetch(pathToFileURL(filePath).toString());
       const headers = new Headers(fileResponse.headers);
-      headers.set('Access-Control-Allow-Origin', '*');
+      headers.set('X-Content-Type-Options', 'nosniff');
+      // Short-lived cache so a preloaded panorama is reused by the viewer's fetch.
+      headers.set('Cache-Control', 'private, max-age=60');
+      // Three.js requests panorama textures with CORS enabled. Grant only the
+      // app renderer's exact origin (file:// is represented as `null`) rather
+      // than making local project images readable by arbitrary web pages.
+      const requestOrigin = request.headers.get('Origin');
+      const trustedOrigin = isDev
+        ? requestOrigin === 'http://localhost:5173'
+        : requestOrigin === 'null';
+      if (trustedOrigin) {
+        headers.set('Access-Control-Allow-Origin', requestOrigin);
+        headers.set('Vary', 'Origin');
+      }
       return new Response(fileResponse.body, {
         status: fileResponse.status,
         statusText: fileResponse.statusText,
@@ -1374,7 +2732,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('projects:list', async () => {
     await ensureProjectRoot();
-    const projects = [];
+    const projectRecords = [];
     const seen = new Set();
     const projectDirs = [];
 
@@ -1397,23 +2755,82 @@ app.whenReady().then(async () => {
 
     for (const projectDir of projectDirs) {
       const resolvedDir = path.resolve(String(projectDir || ''));
-      if (!resolvedDir || seen.has(resolvedDir)) continue;
-      seen.add(resolvedDir);
+      // Recent paths and drive discovery can expose the same physical project
+      // through both a junction and its canonical spelling. Treat it as one
+      // record so duplicate-ID repair never rekeys the shared manifest.
+      const resolvedKey = await canonicalProjectPathKey(resolvedDir);
+      if (!resolvedDir || seen.has(resolvedKey)) continue;
+      seen.add(resolvedKey);
       const projectFile = path.join(resolvedDir, 'project.json');
       if (!(await pathExists(projectFile))) continue;
       try {
         const raw = await fs.readFile(projectFile, 'utf-8');
         const parsed = JSON.parse(raw);
+        if (!isPanoraDeskProjectDocument(parsed)) continue;
+        const declaredPath = typeof parsed?.path === 'string' ? parsed.path : '';
+        parsed.id = String(parsed?.id || '');
         parsed.path = resolvedDir;
-        projects.push(parsed);
+        projectRecords.push({ project: parsed, projectDir: resolvedDir, declaredPath, hidden: false });
       } catch {
       }
     }
 
+    const claimedIds = new Set(projectRecords.map((record) => record.project.id).filter(Boolean));
+    for (const record of projectRecords) {
+      if (record.project.id) continue;
+      const nextId = disambiguatedProjectId('missing-project-id', record.projectDir);
+      try {
+        record.project = await migrateProjectIdentity(record.projectDir, '', nextId);
+        claimedIds.add(record.project.id);
+      } catch (error) {
+        record.hidden = true;
+        await logLine(`Unable to assign project identity for ${record.projectDir}: ${String(error?.message || error)}`);
+      }
+    }
+
+    const recordsById = new Map();
+    for (const record of projectRecords) {
+      if (record.hidden || !record.project.id) continue;
+      const group = recordsById.get(record.project.id) || [];
+      group.push(record);
+      recordsById.set(record.project.id, group);
+    }
+
+    for (const [duplicateId, group] of recordsById.entries()) {
+      if (group.length < 2) continue;
+      group.sort((a, b) => {
+        const aOwnPath = a.declaredPath && projectPathKey(a.declaredPath) === projectPathKey(a.projectDir) ? 1 : 0;
+        const bOwnPath = b.declaredPath && projectPathKey(b.declaredPath) === projectPathKey(b.projectDir) ? 1 : 0;
+        if (aOwnPath !== bOwnPath) return bOwnPath - aOwnPath;
+        return projectPathKey(a.projectDir).localeCompare(projectPathKey(b.projectDir));
+      });
+
+      for (const record of group.slice(1)) {
+        let salt = 0;
+        let nextId = disambiguatedProjectId(duplicateId, record.projectDir, salt);
+        while (claimedIds.has(nextId)) {
+          salt += 1;
+          nextId = disambiguatedProjectId(duplicateId, record.projectDir, salt);
+        }
+        try {
+          record.project = await migrateProjectIdentity(record.projectDir, duplicateId, nextId);
+          claimedIds.add(record.project.id);
+        } catch (error) {
+          // Returning two cards with the same ID makes rename/delete ambiguous;
+          // hide only the copy whose identity could not be persisted.
+          record.hidden = true;
+          await logLine(`Unable to disambiguate copied project ${record.projectDir}: ${String(error?.message || error)}`);
+        }
+      }
+    }
+
+    const projects = projectRecords.filter((record) => !record.hidden).map((record) => record.project);
+
     const sorted = projects
       .sort((a, b) => (b.modifiedDate || '').localeCompare(a.modifiedDate || ''))
       .slice(0, 200);
-    await writeRecentProjectPaths(sorted.map((p) => p.path).filter(Boolean));
+    for (const project of sorted) authorizeProjectMediaRoot(project.path);
+    await mergeRecentProjectPaths(sorted.map((p) => p.path).filter(Boolean));
     return sorted;
   });
 
@@ -1440,112 +2857,202 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('projects:delete', async (_evt, projectId, projectPath) => {
     if (!projectId || typeof projectId !== 'string') return false;
-    await ensureProjectRoot();
-    const rootResolved = path.resolve(PROJECTS_ROOT);
+    if (deletingProjectIds.has(projectId)) return false;
+    deletingProjectIds.add(projectId);
+    let deleteSucceeded = false;
 
-    const deleteVerifiedProjectDir = async (projectDir, requireWithinRoot) => {
-      const resolvedTarget = path.resolve(projectDir);
-      if (requireWithinRoot && !isWithinDir(rootResolved, resolvedTarget)) return false;
+    try {
+      await ensureProjectRoot();
+      const rootResolved = path.resolve(PROJECTS_ROOT);
+      const registeredRecentPaths = await readRecentProjectPaths();
+      const registeredRecentKeys = new Set(await Promise.all(
+        registeredRecentPaths.map((item) => canonicalProjectPathKey(item)),
+      ));
 
-      const projectFile = path.join(resolvedTarget, 'project.json');
-      if (!(await pathExists(projectFile))) return false;
+      const deleteVerifiedProjectDir = async (projectDir) => {
+        const resolvedTarget = path.resolve(projectDir);
+        return enqueueProjectSave(resolvedTarget, projectId, async () => {
+          const dataHomeResolved = path.resolve(DATA_HOME);
+          // Deletion must fail closed if an existing path cannot be resolved.
+          // Falling back to a lexical spelling here would restore the exact
+          // junction escape this classification is meant to prevent.
+          const canonicalPaths = await Promise.all([
+            fs.realpath(resolvedTarget),
+            fs.realpath(rootResolved),
+            fs.realpath(dataHomeResolved),
+          ]).catch(() => null);
+          if (!canonicalPaths) return false;
+          const [canonicalTarget, canonicalRoot, canonicalDataHome] = canonicalPaths;
+          const targetKey = projectPathKey(canonicalTarget);
+          const rootKey = projectPathKey(canonicalRoot);
+          const dataHomeKey = projectPathKey(canonicalDataHome);
+          if (
+            canonicalTarget === path.parse(canonicalTarget).root
+            || targetKey === rootKey
+            || targetKey === dataHomeKey
+          ) return false;
+          // Lexical containment can be forged by a junction below PROJECTS_ROOT.
+          // Only the real target location receives app-owned recursive-delete
+          // authority; an external target must pass the stricter proof below.
+          const isAppRootProject = isWithinDir(canonicalRoot, canonicalTarget);
+          const ownershipMarkerPath = path.join(canonicalTarget, PROJECT_OWNERSHIP_MARKER);
+          const ownershipMarkerExists = await pathExists(ownershipMarkerPath);
+          const ownershipMarkerMatches = (await ownershipMarkerIdAtPath(canonicalTarget)) === projectId;
 
-      try {
-        const raw = await fs.readFile(projectFile, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (parsed?.id !== projectId) return false;
-      } catch {
+          const projectFile = path.join(canonicalTarget, 'project.json');
+          if (!(await pathExists(projectFile))) return false;
+
+          try {
+            const raw = await fs.readFile(projectFile, 'utf-8');
+            const parsed = JSON.parse(raw);
+            if (!isPanoraDeskProjectDocument(parsed) || String(parsed?.id || '') !== projectId) return false;
+          } catch {
+            return false;
+          }
+
+          // A marker is a plain sidecar and can be copied or forged. External
+          // recursive deletion additionally requires a validated dedicated
+          // scaffold and exact evidence in PanoraDesk's own recent-path index.
+          // Legacy projects without a marker remain eligible when their
+          // structure and registry entry prove the directory is dedicated;
+          // an invalid/mismatched marker always downgrades to manifest-only.
+          const hasDedicatedProjectStructure = !isAppRootProject
+            && await isProvablyDedicatedLegacyProjectDir(canonicalTarget, projectId);
+          const hasKnownRecentIdentity = registeredRecentKeys.has(targetKey);
+          const markerIdentityIsSafe = !ownershipMarkerExists || ownershipMarkerMatches;
+          const canRecursivelyDeleteExternal = hasDedicatedProjectStructure
+            && hasKnownRecentIdentity
+            && markerIdentityIsSafe;
+
+          // External legacy manifests may live in a shared folder. Removing
+          // just the verified project.json makes the project disappear without
+          // recursively deleting unrelated user files or sibling directories.
+          if (!isAppRootProject && !canRecursivelyDeleteExternal) {
+            await fs.rm(projectFile, { force: true });
+            revokeProjectMediaRoot(resolvedTarget);
+            if (projectPathKey(canonicalTarget) !== projectPathKey(resolvedTarget)) {
+              revokeProjectMediaRoot(canonicalTarget);
+            }
+            return true;
+          }
+
+          await fs.rm(canonicalTarget, { recursive: true, force: true });
+          revokeProjectMediaRoot(resolvedTarget);
+          if (projectPathKey(canonicalTarget) !== projectPathKey(resolvedTarget)) {
+            revokeProjectMediaRoot(canonicalTarget);
+          }
+          return true;
+        });
+      };
+
+      const requestedProjectPath = typeof projectPath === 'string' ? projectPath.trim() : '';
+      if (requestedProjectPath) {
+        const requestedResolved = path.resolve(requestedProjectPath);
+        const deletedRequested = await deleteVerifiedProjectDir(requestedResolved);
+        if (deletedRequested) {
+          deleteSucceeded = true;
+          await removeRecentProjectPath(requestedResolved);
+          return true;
+        }
+        // An explicit folder is the project identity. Never fall back to a
+        // different directory merely because it happens to carry the same ID.
         return false;
       }
 
-      await fs.rm(resolvedTarget, { recursive: true, force: true });
-      return true;
-    };
+      const candidateDirs = [];
+      const seen = new Set();
+      const pushCandidate = (dirPath) => {
+        const resolved = path.resolve(String(dirPath || ''));
+        if (!resolved || seen.has(resolved)) return;
+        seen.add(resolved);
+        candidateDirs.push(resolved);
+      };
 
-    const requestedProjectPath = typeof projectPath === 'string' ? projectPath.trim() : '';
-    if (requestedProjectPath) {
-      const requestedResolved = path.resolve(requestedProjectPath);
-      if (await pathExists(requestedResolved)) {
-        const deletedRequested = await deleteVerifiedProjectDir(
-          requestedResolved,
-          isWithinDir(rootResolved, requestedResolved),
-        );
-        if (deletedRequested) {
-          const recents = await readRecentProjectPaths();
-          await writeRecentProjectPaths(recents.filter((p) => path.resolve(p) !== requestedResolved));
-          return true;
+      try {
+        const entries = await fs.readdir(PROJECTS_ROOT, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          pushCandidate(path.join(PROJECTS_ROOT, entry.name));
         }
+      } catch {}
+
+      const recentDirs = await readRecentProjectPaths();
+      for (const dir of recentDirs) pushCandidate(dir);
+
+      const discoveredDirs = await discoverProjectDirs();
+      for (const dir of discoveredDirs) pushCandidate(dir);
+
+      for (const dir of candidateDirs) {
+        const deleted = await deleteVerifiedProjectDir(dir);
+        if (!deleted) continue;
+        deleteSucceeded = true;
+        await removeRecentProjectPath(dir);
+        return true;
       }
+
+      return false;
+    } finally {
+      // A successfully deleted project stays blocked for the rest of this app
+      // session so a stale renderer save cannot recreate its directory.
+      if (!deleteSucceeded) deletingProjectIds.delete(projectId);
     }
-
-    const candidateDirs = [];
-    const seen = new Set();
-    const pushCandidate = (dirPath) => {
-      const resolved = path.resolve(String(dirPath || ''));
-      if (!resolved || seen.has(resolved)) return;
-      seen.add(resolved);
-      candidateDirs.push(resolved);
-    };
-
-    try {
-      const entries = await fs.readdir(PROJECTS_ROOT, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        pushCandidate(path.join(PROJECTS_ROOT, entry.name));
-      }
-    } catch {}
-
-    const recentDirs = await readRecentProjectPaths();
-    for (const dir of recentDirs) pushCandidate(dir);
-
-    const discoveredDirs = await discoverProjectDirs();
-    for (const dir of discoveredDirs) pushCandidate(dir);
-
-    for (const dir of candidateDirs) {
-      const deleted = await deleteVerifiedProjectDir(dir, isWithinDir(rootResolved, dir));
-      if (!deleted) continue;
-      const recents = await readRecentProjectPaths();
-      await writeRecentProjectPaths(recents.filter((p) => path.resolve(p) !== dir));
-      return true;
-    }
-
-    return false;
   });
 
   ipcMain.handle('projects:save', async (_evt, project) => {
-    const projectDir = await ensureProjectScaffold(project);
-    const payload = { ...project, path: projectDir, modifiedDate: new Date().toISOString() };
-    // Write atomically: a plain writeFile that is interrupted (e.g. app quit
-    // mid-save) can leave project.json truncated and corrupt the whole project.
-    const targetFile = path.join(projectDir, 'project.json');
-    const tmpFile = path.join(projectDir, `.project.json.tmp-${process.pid}-${Date.now()}`);
-    try {
-      await fs.writeFile(tmpFile, JSON.stringify(payload, null, 2), 'utf-8');
-      await fs.rename(tmpFile, targetFile);
-    } catch (err) {
-      try { await fs.rm(tmpFile, { force: true }); } catch {}
-      throw err;
+    if (!isPanoraDeskProjectDocument(project)) {
+      throw new Error('Invalid PanoraDesk project payload.');
     }
-    await touchRecentProjectPath(projectDir);
-    return payload;
+    const identityError = projectIdentityValidationError(project);
+    if (identityError) throw new Error(`Cannot save project because ${identityError}.`);
+    if (!project?.id || deletingProjectIds.has(project.id)) {
+      throw new Error('Cannot save a project while it is being deleted.');
+    }
+    const requestedProjectDir = getProjectDir(project);
+    if (await isRetiredProjectIdentity(requestedProjectDir, project.id)) {
+      throw new Error('This project copy received a new identity. Reopen it before saving.');
+    }
+    return await enqueueProjectSave(requestedProjectDir, project.id, async () => {
+      if (deletingProjectIds.has(project.id)) {
+        throw new Error('Cannot save a project while it is being deleted.');
+      }
+      if (await isRetiredProjectIdentity(requestedProjectDir, project.id)) {
+        throw new Error('This project copy received a new identity. Reopen it before saving.');
+      }
+      const projectDir = await ensureProjectScaffold(project);
+      const payload = { ...project, path: projectDir, modifiedDate: new Date().toISOString() };
+      // Write atomically: an interrupted plain writeFile can truncate the
+      // only project manifest and corrupt the whole tour.
+      await writeProjectFileAtomic(projectDir, payload);
+      await touchRecentProjectPath(projectDir);
+      return payload;
+    });
   });
 
   ipcMain.handle('projects:open-dialog', async () => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile'],
-      filters: [{ name: 'PanoraDesk Project', extensions: ['json'] }],
+      title: 'Open PanoraDesk project.json',
+      filters: [{ name: 'PanoraDesk Project Manifest', extensions: ['json'] }],
     });
 
     if (result.canceled || result.filePaths.length === 0) return null;
     try {
-      const selected = result.filePaths[0];
-      const raw = await fs.readFile(selected, 'utf-8');
-      const project = JSON.parse(raw);
-      project.path = path.dirname(selected);
-      await touchRecentProjectPath(project.path);
-      return project;
-    } catch {
-      throw new Error('Invalid or unreadable project file.');
+      // Editable projects always use the canonical project.json manifest.
+      // Accepting arbitrary renamed JSON also accepts exported assets/tour.json,
+      // which carries the source project's ID but is not a writable manifest.
+      return await loadProjectFile(result.filePaths[0], { requireCanonicalManifest: true });
+    } catch (error) {
+      throw new Error(error?.message || 'Invalid or unreadable project file.');
+    }
+  });
+
+  ipcMain.handle('projects:open-file', async (_evt, selectedPath) => {
+    try {
+      // Exported assets/tour.json has a project-like shape, but is not an
+      // editable manifest and must never be assigned a writable project path.
+      return await loadProjectFile(selectedPath, { requireCanonicalManifest: true });
+    } catch (error) {
+      throw new Error(error?.message || 'Invalid or unreadable project file.');
     }
   });
 
@@ -1566,48 +3073,92 @@ app.whenReady().then(async () => {
       return { projectPath: getProjectDir(project), scenes: [] };
     }
 
-    const projectDir = await ensureProjectScaffold(project);
-    const items = [];
-    const total = result.filePaths.length;
-
-    _evt.sender.send('media:import-scenes-progress', {
-      stage: 'start',
-      total,
-      current: 0,
-      currentFile: null,
-    });
-
-    for (let index = 0; index < result.filePaths.length; index += 1) {
-      const sourcePath = result.filePaths[index];
-      _evt.sender.send('media:import-scenes-progress', {
-        stage: 'processing',
-        total,
-        current: index + 1,
-        currentFile: path.basename(sourcePath),
-      });
-      const imageRel = await importSceneImageToProject(projectDir, sourcePath, 'panoramas', {
-        maxEdge: SCENE_IMPORT_MAX_EDGE,
-        quality: SCENE_IMPORT_JPEG_QUALITY,
-      });
-      const thumbRel = await importSceneImageToProject(projectDir, sourcePath, 'thumbnails', {
-        maxEdge: SCENE_THUMBNAIL_MAX_EDGE,
-        quality: SCENE_THUMBNAIL_JPEG_QUALITY,
-      });
-      items.push({
-        name: path.basename(sourcePath, path.extname(sourcePath)),
-        image: imageRel,
-        thumbnail: thumbRel,
-      });
+    const requestedProjectDir = getProjectDir(project);
+    if (deletingProjectIds.has(project?.id)) return { projectPath: requestedProjectDir, scenes: [] };
+    if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+      throw new Error('This project copy received a new identity. Reopen it before importing scenes.');
     }
+    return enqueueProjectSave(requestedProjectDir, project?.id, async () => {
+      if (deletingProjectIds.has(project?.id)) return { projectPath: requestedProjectDir, scenes: [] };
+      if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+        throw new Error('This project copy received a new identity. Reopen it before importing scenes.');
+      }
+      if (_evt.sender.isDestroyed()) {
+        throw new Error('Scene import was canceled because the app window closed.');
+      }
+      const projectDir = await ensureProjectScaffold(project);
+      const items = [];
+      const createdFiles = [];
+      const total = result.filePaths.length;
+      const requestedIdentityKey = await projectIdentityKey(requestedProjectDir, project?.id);
+      const assertImportIsActive = () => {
+        if (_evt.sender.isDestroyed()) throw new Error('Scene import was canceled because the app window closed.');
+        if (deletingProjectIds.has(project?.id)) throw new Error('Scene import was canceled because the project is being deleted.');
+        if (retiredProjectIdentities.has(requestedIdentityKey)) {
+          throw new Error('This project copy received a new identity. Reopen it before importing scenes.');
+        }
+      };
+      const rememberCreatedFile = (relativePath) => {
+        const absolutePath = projectAbsolute(projectDir, relativePath);
+        if (absolutePath) createdFiles.push(absolutePath);
+      };
 
-    _evt.sender.send('media:import-scenes-progress', {
-      stage: 'done',
-      total,
-      current: total,
-      currentFile: null,
+      try {
+        assertImportIsActive();
+        _evt.sender.send('media:import-scenes-progress', {
+          stage: 'start',
+          total,
+          current: 0,
+          currentFile: null,
+        });
+
+        for (let index = 0; index < result.filePaths.length; index += 1) {
+          assertImportIsActive();
+          const sourcePath = result.filePaths[index];
+          _evt.sender.send('media:import-scenes-progress', {
+            stage: 'processing',
+            total,
+            current: index + 1,
+            currentFile: path.basename(sourcePath),
+          });
+          const imageRel = await importSceneImageToProject(projectDir, sourcePath, 'panoramas', {
+            maxEdge: SCENE_IMPORT_MAX_EDGE,
+            quality: SCENE_IMPORT_JPEG_QUALITY,
+          });
+          rememberCreatedFile(imageRel);
+          assertImportIsActive();
+          const thumbRel = await importSceneImageToProject(projectDir, sourcePath, 'thumbnails', {
+            maxEdge: SCENE_THUMBNAIL_MAX_EDGE,
+            quality: SCENE_THUMBNAIL_JPEG_QUALITY,
+          });
+          rememberCreatedFile(thumbRel);
+          items.push({
+            name: path.basename(sourcePath, path.extname(sourcePath)),
+            image: imageRel,
+            thumbnail: thumbRel,
+          });
+        }
+
+        assertImportIsActive();
+        _evt.sender.send('media:import-scenes-progress', {
+          stage: 'done',
+          total,
+          current: total,
+          currentFile: null,
+        });
+
+        return { projectPath: projectDir, scenes: items };
+      } catch (error) {
+        for (const createdFile of createdFiles.reverse()) {
+          try {
+            await fs.rm(createdFile, { force: true });
+          } catch (rollbackError) {
+            await logLine(`Unable to roll back imported scene file ${createdFile}: ${String(rollbackError?.message || rollbackError)}`);
+          }
+        }
+        throw error;
+      }
     });
-
-    return { projectPath: projectDir, scenes: items };
   });
 
   ipcMain.handle('media:upload-logo', async (_evt, project) => {
@@ -1617,9 +3168,20 @@ app.whenReady().then(async () => {
     });
     if (result.canceled || result.filePaths.length === 0) return null;
 
-    const projectDir = await ensureProjectScaffold(project);
-    const rel = await copyImageToProject(projectDir, result.filePaths[0], path.join('assets', 'logo'));
-    return { projectPath: projectDir, path: rel };
+    const requestedProjectDir = getProjectDir(project);
+    if (deletingProjectIds.has(project?.id)) return null;
+    if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+      throw new Error('This project copy received a new identity. Reopen it before uploading a logo.');
+    }
+    return enqueueProjectSave(requestedProjectDir, project?.id, async () => {
+      if (deletingProjectIds.has(project?.id)) return null;
+      if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+        throw new Error('This project copy received a new identity. Reopen it before uploading a logo.');
+      }
+      const projectDir = await ensureProjectScaffold(project);
+      const rel = await copyImageToProject(projectDir, result.filePaths[0], path.join('assets', 'logo'));
+      return { projectPath: projectDir, path: rel };
+    });
   });
 
   ipcMain.handle('media:upload-floorplan', async (_evt, project) => {
@@ -1629,9 +3191,20 @@ app.whenReady().then(async () => {
     });
     if (result.canceled || result.filePaths.length === 0) return null;
 
-    const projectDir = await ensureProjectScaffold(project);
-    const rel = await copyImageToProject(projectDir, result.filePaths[0], path.join('assets', 'floorplans'));
-    return { projectPath: projectDir, path: rel };
+    const requestedProjectDir = getProjectDir(project);
+    if (deletingProjectIds.has(project?.id)) return null;
+    if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+      throw new Error('This project copy received a new identity. Reopen it before uploading a floor plan.');
+    }
+    return enqueueProjectSave(requestedProjectDir, project?.id, async () => {
+      if (deletingProjectIds.has(project?.id)) return null;
+      if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+        throw new Error('This project copy received a new identity. Reopen it before uploading a floor plan.');
+      }
+      const projectDir = await ensureProjectScaffold(project);
+      const rel = await copyImageToProject(projectDir, result.filePaths[0], path.join('assets', 'floorplans'));
+      return { projectPath: projectDir, path: rel };
+    });
   });
 
   ipcMain.handle('projects:health-check', async (_evt, project, options) => {
@@ -1639,6 +3212,8 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('projects:export-web', async (_evt, project, options) => {
+    // The dialog is not a critical operation: only the filesystem work after the
+    // user picks a destination may delay quit.
     const defaultName = `panoradesk360-${slugify(project.name || 'tour')}.zip`;
     const result = await dialog.showSaveDialog({
       title: 'Save Tour ZIP',
@@ -1646,25 +3221,31 @@ app.whenReady().then(async () => {
       filters: [{ name: 'ZIP Archive', extensions: ['zip'] }],
     });
     if (result.canceled || !result.filePath) return { canceled: true };
-
+    return runCriticalMainOperation('website ZIP export', async () => {
     const health = await runProjectHealthCheck(project, options);
     if (!health.ok) {
       return { canceled: true, notes: `Health check failed:\n${health.issues.join('\n')}` };
     }
 
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'panoradesk-export-'));
+    let exported;
     try {
-      const exported = await performExport(project, { ...(options || {}), zipOutput: false }, tmpDir);
-      await writeZipFromFolder(exported.exportDir, result.filePath);
+      exported = await performExport(project, { ...(options || {}), zipOutput: false }, tmpDir);
+      await writeZipAtomically(exported.exportDir, result.filePath);
     } finally {
-      fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      try {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      } catch (error) {
+        await logLine(`Unable to remove ZIP export staging directory ${tmpDir}: ${String(error?.message || error)}`);
+      }
     }
 
     return {
       canceled: false,
       zipPath: result.filePath,
-      iframeCode: iframeSnippet(`panoradesk360-${slugify(project.name || 'tour')}`, options?.iframe),
+      iframeCode: iframeSnippet(exported.folderName, options?.iframe),
     };
+    });
   });
 
   ipcMain.handle('system:open-path', async (_evt, targetPath) => {
@@ -1673,27 +3254,63 @@ app.whenReady().then(async () => {
     return err === '';
   });
 
-  ipcMain.handle('app:confirm-close', () => {
+  ipcMain.handle('app:confirm-close', (_evt, requestId) => {
+    if (!pendingCloseRequestId || String(requestId || '') !== pendingCloseRequestId) return false;
+    pendingCloseRequestId = null;
     allowAppClose = true;
     if (appCloseFallbackTimer) { clearTimeout(appCloseFallbackTimer); appCloseFallbackTimer = null; }
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
     return true;
   });
 
+  ipcMain.handle('app:cancel-close', (_evt, requestId) => {
+    if (!pendingCloseRequestId || String(requestId || '') !== pendingCloseRequestId) return false;
+    pendingCloseRequestId = null;
+    allowAppClose = false;
+    if (appCloseFallbackTimer) { clearTimeout(appCloseFallbackTimer); appCloseFallbackTimer = null; }
+    return true;
+  });
+
   ipcMain.handle('system:delete-file', async (_evt, projectPath, relPath) => {
     if (!relPath || typeof relPath !== 'string') return false;
     if (!projectPath || typeof projectPath !== 'string') return false;
-    // Two checks, not one: the directory has to actually be a project (either
-    // under our projects root or holding a project.json), and the asset has to
-    // resolve inside it. Validating only the second lets the renderer pass
-    // projectPath='C:\\' and delete anything on the drive.
+    // The directory must contain a recognizable PanoraDesk manifest; merely
+    // being under our data root, or containing an unrelated project.json, is
+    // not enough authority to delete a file.
     const projectDir = path.resolve(projectPath);
-    const isKnownProjectDir = isWithinDir(path.resolve(PROJECTS_ROOT), projectDir)
-      || (await pathExists(path.join(projectDir, 'project.json')));
-    if (!isKnownProjectDir) return false;
+    try {
+      const manifest = JSON.parse(await fs.readFile(path.join(projectDir, 'project.json'), 'utf-8'));
+      if (!isPanoraDeskProjectDocument(manifest)) return false;
+    } catch {
+      return false;
+    }
 
     const target = projectAbsolute(projectDir, relPath);
     if (!target || isWithinDir(target, projectDir)) return false;
+    // Lexical containment is not sufficient when a project contains a
+    // symlink/junction directory. Resolve both ends before unlinking so a path
+    // such as assets/link/outside.jpg cannot delete a file outside the project.
+    try {
+      const [realProjectDir, realTarget] = await Promise.all([
+        fs.realpath(projectDir),
+        fs.realpath(target),
+      ]);
+      if (!isWithinDir(realProjectDir, realTarget) || projectPathKey(realProjectDir) === projectPathKey(realTarget)) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    const targetKey = projectPathKey(target);
+    const protectedKeys = new Set([
+      projectPathKey(path.join(projectDir, 'project.json')),
+      projectPathKey(path.join(projectDir, PROJECT_OWNERSHIP_MARKER)),
+    ]);
+    // Compare resolved paths so aliases such as assets/../project.json cannot
+    // bypass the manifest protection.
+    if (protectedKeys.has(targetKey)) {
+      return false;
+    }
     try {
       await fs.unlink(target);
       return true;
@@ -1711,6 +3328,8 @@ app.whenReady().then(async () => {
     const settings = await getDeploySettings();
     const defaultPath = settings.websitePath || undefined;
 
+    // Only the work after a folder is chosen is critical; an open dialog must
+    // not hold up quitting.
     const result = await dialog.showOpenDialog({
       properties: ['openDirectory', 'createDirectory'],
       title: 'Select Website Root Folder',
@@ -1718,6 +3337,7 @@ app.whenReady().then(async () => {
     });
     if (result.canceled || result.filePaths.length === 0) return { canceled: true };
 
+    return runCriticalMainOperation('website deployment', async () => {
     const websiteDir = result.filePaths[0];
     await saveDeploySettings({ ...settings, websitePath: websiteDir });
 
@@ -1741,61 +3361,109 @@ app.whenReady().then(async () => {
       tourPath: deployed.tourPath,
       pageFile: deployed.pageFile,
     };
+    });
   });
-  ipcMain.handle('projects:preview-export', async (_evt, project, options) => {
+  ipcMain.handle('projects:preview-export', (_evt, project, options) => runCriticalMainOperation(
+    'windowed export preview',
+    () => enqueuePreviewOperation('active', async () => {
     const health = await runProjectHealthCheck(project, options);
     if (!health.ok) {
       throw new Error(`Health check failed:\n${health.issues.join('\n')}`);
     }
 
     const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'panoradesk-preview-'));
-    const exported = await performExport(project, { ...(options || {}), zipOutput: false }, baseDir);
+    const previewInstance = { server: null, window: null, root: null, tempRoot: baseDir };
+    try {
+      const exported = await performExport(project, { ...(options || {}), zipOutput: false }, baseDir);
+      previewInstance.root = exported.exportDir;
+      const { server, url } = await startStaticServer(exported.exportDir);
+      previewInstance.server = server;
 
-    const existing = previewServers.get('active');
-    if (existing) {
-      previewServers.delete('active');
-      await cleanupPreviewInstance(existing);
-    }
+      // Keep the previous preview usable until its replacement is fully
+      // exported and serving, then dispose its window, server, and temp tree.
+      const existing = previewServers.get('active');
+      if (existing) {
+        previewServers.delete('active');
+        await cleanupPreviewInstance(existing);
+      }
 
-    const { server, url } = await startStaticServer(exported.exportDir);
-    const previewInstance = { server, root: exported.exportDir, tempRoot: baseDir };
-    previewServers.set('active', previewInstance);
+      const previewWindow = new BrowserWindow({
+        width: 1400,
+        height: 900,
+        autoHideMenuBar: true,
+        ...(APP_WINDOW_ICON ? { icon: APP_WINDOW_ICON } : {}),
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+        },
+      });
+      guardPreviewWindowNavigation(previewWindow, url);
+      previewInstance.window = previewWindow;
+      previewServers.set('active', previewInstance);
 
-    const previewWindow = new BrowserWindow({
-      width: 1400,
-      height: 900,
-      autoHideMenuBar: true,
-      ...(APP_WINDOW_ICON ? { icon: APP_WINDOW_ICON } : {}),
-    });
-    await previewWindow.loadURL(url);
-
-    previewWindow.on('closed', () => {
-      const active = previewServers.get('active');
-      if (active === previewInstance) {
+      previewWindow.on('closed', () => {
+        previewInstance.window = null;
+        const active = previewServers.get('active');
+        if (active === previewInstance) {
+          previewServers.delete('active');
+        }
+        void cleanupPreviewInstance(previewInstance);
+      });
+      await previewWindow.loadURL(url);
+      return { url, exportDir: exported.exportDir };
+    } catch (error) {
+      if (previewServers.get('active') === previewInstance) {
         previewServers.delete('active');
       }
-      void cleanupPreviewInstance(previewInstance);
-    });
+      await cleanupPreviewInstance(previewInstance);
+      throw error;
+    }
+    }),
+  ));
 
-    return { url, exportDir: exported.exportDir };
-  });
-
-  ipcMain.handle('projects:inline-preview', async (_evt, project, options) => {
+  ipcMain.handle('projects:inline-preview', (_evt, project, options) => runCriticalMainOperation(
+    'inline export preview',
+    () => enqueuePreviewOperation('inline', async () => {
     const health = await runProjectHealthCheck(project, options);
     if (!health.ok) {
       throw new Error(`Health check failed:\n${health.issues.join('\n')}`);
     }
     const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'panoradesk-inline-'));
-    const exported = await performExport(project, { ...(options || {}), zipOutput: false }, baseDir);
-    const existing = previewServers.get('inline');
-    if (existing) {
+    const previewInstance = { server: null, window: null, root: null, tempRoot: baseDir };
+    try {
+      const exported = await performExport(project, { ...(options || {}), zipOutput: false }, baseDir);
+      previewInstance.root = exported.exportDir;
+      const { server, url } = await startStaticServer(exported.exportDir);
+      previewInstance.server = server;
+
+      const existing = previewServers.get('inline');
+      if (existing) {
+        previewServers.delete('inline');
+        await cleanupPreviewInstance(existing);
+      }
+      previewServers.set('inline', previewInstance);
+      return { url };
+    } catch (error) {
+      if (previewServers.get('inline') === previewInstance) {
+        previewServers.delete('inline');
+      }
+      await cleanupPreviewInstance(previewInstance);
+      throw error;
+    }
+    }),
+  ));
+
+  ipcMain.handle('projects:release-inline-preview', () => runCriticalMainOperation(
+    'inline preview cleanup',
+    () => enqueuePreviewOperation('inline', async () => {
+      const existing = previewServers.get('inline');
+      if (!existing) return true;
       previewServers.delete('inline');
       await cleanupPreviewInstance(existing);
-    }
-    const { server, url } = await startStaticServer(exported.exportDir);
-    previewServers.set('inline', { server, root: exported.exportDir, tempRoot: baseDir });
-    return { url };
-  });
+      return true;
+    }),
+  ));
 
   await createWindow();
 
@@ -1810,11 +3478,27 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (!allowQuitAfterCriticalOperations && criticalMainOperations.size > 0) {
+    event.preventDefault();
+    if (!deferredQuitPromise) {
+      const labels = Array.from(criticalMainOperations.values(), (pending) => pending.label).join(', ');
+      void logLine(`delaying quit for critical operations: ${labels}`);
+      deferredQuitPromise = waitForCriticalMainOperations().then(() => {
+        allowQuitAfterCriticalOperations = true;
+        deferredQuitPromise = null;
+        app.quit();
+      });
+    }
+    return;
+  }
   // Every live preview, not just the windowed one — the inline preview used to
   // be skipped here and left a full copy of the exported tour in %TEMP%.
   for (const [key, instance] of Array.from(previewServers.entries())) {
     previewServers.delete(key);
+    try {
+      if (instance?.window && !instance.window.isDestroyed()) instance.window.destroy();
+    } catch {}
     try { instance?.server?.close(); } catch {}
     const tempRoot = instance?.tempRoot || instance?.root;
     if (!tempRoot) continue;

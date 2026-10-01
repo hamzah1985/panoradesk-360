@@ -11,15 +11,12 @@ import { useEditorStore } from '../../store/editorStore';
 import { useUiStore } from '../../store/uiStore';
 import { cn } from '../../lib/utils';
 
-const AUTO_SAVE_INTERVAL_MS = 30_000;
-
 const AppShell = () => {
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
   const [isFloorPlanOpen, setIsFloorPlanOpen] = React.useState(false);
   const [isFocusMode, setIsFocusMode] = React.useState(false);
   const [isFloorPlanPlacing, setIsFloorPlanPlacing] = React.useState(false);
-  const { selectedId, project, saveProject, saveState, savedModifiedDate } = useProjectStore();
-  const isDirty = project ? project.modifiedDate !== savedModifiedDate : false;
+  const { selectedId, project } = useProjectStore();
   const { activeTool, setActiveTool } = useEditorStore();
   const { pushToast } = useUiStore();
 
@@ -31,34 +28,6 @@ const AppShell = () => {
     { id: 'hotspot' as const, icon: MapPin, label: 'Hotspot', shortcut: 'H', enabled: hasNavigationTargets, iconColor: 'text-red-400' },
     { id: 'marker' as const, icon: Info, label: 'Marker', shortcut: 'M', enabled: true, iconColor: 'text-blue-400' },
   ];
-
-  // Warn before unload when there are unsaved changes. Skipped in the desktop
-  // build: Electron cancels the close for any non-undefined returnValue, and
-  // the main process already flushes pending saves over IPC before closing.
-  React.useEffect(() => {
-    const hasCloseHandshake = !!(window.electronAPI?.onFlushBeforeClose && window.electronAPI?.confirmClose);
-    if (hasCloseHandshake) return;
-    const onBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (!isDirty) return;
-      e.preventDefault();
-      e.returnValue = '';
-    };
-    window.addEventListener('beforeunload', onBeforeUnload);
-    return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [isDirty]);
-
-  // Auto-save every 30 s when dirty and not already saving
-  React.useEffect(() => {
-    if (!project) return;
-    const timer = setInterval(() => {
-      const state = useProjectStore.getState();
-      const dirty = state.project ? state.project.modifiedDate !== state.savedModifiedDate : false;
-      if (dirty && state.saveState !== 'saving') {
-        void state.saveProject();
-      }
-    }, AUTO_SAVE_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, [project?.id]);
 
   React.useEffect(() => {
     const onToggleFloorPlan = () => setIsFloorPlanOpen((prev) => !prev);

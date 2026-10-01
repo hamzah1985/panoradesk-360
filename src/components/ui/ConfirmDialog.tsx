@@ -6,9 +6,14 @@ import { useEscapeClose } from '../../hooks/useEscapeClose';
 const ConfirmDialog = () => {
   const { confirm, closeConfirm, pushToast } = useUiStore();
   const [submitting, setSubmitting] = React.useState(false);
-  useEscapeClose(confirm.open, closeConfirm);
+  const submittingRef = React.useRef(false);
+  const closeWhenIdle = React.useCallback(() => {
+    if (!submittingRef.current) closeConfirm();
+  }, [closeConfirm]);
+  useEscapeClose(confirm.open, closeWhenIdle);
   const runConfirm = React.useCallback(async () => {
-    if (submitting) return;
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       await confirm.onConfirm?.();
@@ -16,11 +21,13 @@ const ConfirmDialog = () => {
     } catch {
       pushToast('error', 'Action failed. Please try again.');
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [confirm.onConfirm, closeConfirm, submitting, pushToast]);
+  }, [confirm.onConfirm, closeConfirm, pushToast]);
   const runAlt = React.useCallback(async () => {
-    if (submitting) return;
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       await confirm.onAlt?.();
@@ -28,24 +35,34 @@ const ConfirmDialog = () => {
     } catch {
       pushToast('error', 'Action failed. Please try again.');
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [confirm.onAlt, closeConfirm, submitting, pushToast]);
+  }, [confirm.onAlt, closeConfirm, pushToast]);
 
   React.useEffect(() => {
-    if (!confirm.open) setSubmitting(false);
+    if (!confirm.open) {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
   }, [confirm.open]);
 
   React.useEffect(() => {
     if (!confirm.open) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Enter') {
+        // Let the browser activate the button that actually owns focus. The
+        // window-level shortcut must only provide a default when focus is not
+        // already on Cancel, the alternate action, or the primary action.
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('button, a[href], [role="button"]')) return;
         e.preventDefault();
+        e.stopImmediatePropagation();
         void runConfirm();
       }
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [confirm.open, runConfirm]);
 
   if (!confirm.open) return null;

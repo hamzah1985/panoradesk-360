@@ -3,6 +3,14 @@ import React from 'react';
 const escapeCloseStack: string[] = [];
 let escapeCloseCounter = 0;
 
+export function hasEscapeCloseLayer() {
+  return escapeCloseStack.length > 0;
+}
+
+export function getEscapeCloseLayerCount() {
+  return escapeCloseStack.length;
+}
+
 export function useEscapeClose(enabled: boolean, onClose: () => void) {
   const onCloseRef = React.useRef(onClose);
   React.useEffect(() => {

@@ -57,7 +57,11 @@ const TargetScenePickerModal: React.FC<Props> = ({ open, project, currentSceneId
       const active = document.activeElement as HTMLElement | null;
       const tag = (active?.tagName || '').toUpperCase();
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!active?.isContentEditable;
-      if (typing) return;
+      if (active?.closest('button, a[href], [role="button"]')) return;
+      // From the single-line search field, Enter picks the highlighted result and
+      // Up/Down move the highlight. Home/End and the rest stay with the text field.
+      const searchKeys = e.key === 'Enter' || ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && tag === 'INPUT');
+      if (typing && !searchKeys) return;
 
       if (e.key === 'ArrowDown') {
         if (!filtered.length) return;

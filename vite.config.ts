@@ -4,27 +4,25 @@ import fs from 'node:fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
-const BUILD_NUMBER_FILE = path.resolve(__dirname, 'build-number.json');
+const BUILD_INFO_FILE = path.resolve(__dirname, 'electron', 'build-info.json');
 
-// Returns the build number to embed in this run. Starts at 25 and advances by
-// one on every production build (`vite build`); dev/serve just reads the
-// current value without bumping it.
-function resolveBuildNumber(isBuild: boolean): number {
-  let current = 25;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(BUILD_NUMBER_FILE, 'utf-8'));
-    if (Number.isFinite(parsed?.build)) current = parsed.build;
-  } catch {
-    current = 25;
-  }
-  if (isBuild) {
-    fs.writeFileSync(BUILD_NUMBER_FILE, JSON.stringify({build: current + 1}, null, 2) + '\n');
-  }
-  return current;
+// Build number = local date and time of the build, e.g. 2026.10.01-1455. The
+// package.json semver is left alone because installers/updaters require it.
+function makeBuildNumber(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}.${pad(date.getMonth() + 1)}.${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}`;
 }
 
-export default defineConfig(({command}) => {
-  const buildNumber = resolveBuildNumber(command === 'build');
+export default defineConfig(() => {
+  // Production builds stamp the moment of the build; dev stamps server start.
+  const now = new Date();
+  const buildNumber = makeBuildNumber(now);
+  // The Electron main process shows the same number in the window title.
+  try {
+    fs.writeFileSync(BUILD_INFO_FILE, JSON.stringify({buildNumber, builtAt: now.toISOString()}, null, 2) + '\n');
+  } catch {
+    // Non-fatal: the window title falls back to the package version.
+  }
   return {
     base: './',
     plugins: [react(), tailwindcss()],

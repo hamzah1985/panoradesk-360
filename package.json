@@ -36,6 +36,8 @@
     "icons:generate": "node scripts/generate-app-icons.mjs",
     "vendor:bundle": "node scripts/bundle-vendor.mjs",
     "prepare": "node scripts/bundle-vendor.mjs",
+    "electron:unpacked": "npm run vendor:bundle && npm run build && electron-builder --win --x64 --dir && node scripts/update-shortcut.mjs",
+    "electron:local": "node scripts/run-local.mjs",
     "electron:dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && electron .\"",
     "electron:build": "npm run icons:generate && npm run vendor:bundle && npm run build && electron-builder --win --x64"
   },

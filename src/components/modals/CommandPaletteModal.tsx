@@ -67,6 +67,8 @@ const CommandPaletteModal = ({ open, onClose, items }: { open: boolean; onClose:
         setActiveIndex(filtered.length - 1);
       }
       if (e.key === 'Enter') {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('button, a[href], [role="button"]')) return;
         e.preventDefault();
         const item = filtered[activeIndex];
         if (!item) return;

@@ -40,15 +40,15 @@ const KeyboardShortcutsModal = ({ open, onClose }: { open: boolean; onClose: () 
 
   return (
     <div onMouseDown={onClose} className="fixed inset-0 z-[170] bg-black/55 backdrop-blur-sm flex items-center justify-center p-6">
-      <div onMouseDown={(e) => e.stopPropagation()} className="w-full max-w-lg rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden">
-        <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+      <div onMouseDown={(e) => e.stopPropagation()} className="w-full max-w-lg max-h-[calc(100vh-3rem)] rounded-2xl bg-white border border-slate-200 shadow-2xl overflow-hidden flex flex-col">
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
             <Keyboard className="w-4 h-4 text-primary" />
             <h3 className="font-semibold text-slate-800">Keyboard Shortcuts</h3>
           </div>
           <button onClick={onClose} className="px-2 py-1 text-slate-500 hover:text-slate-800">Close</button>
         </div>
-        <div className="p-4 space-y-2">
+        <div className="p-4 space-y-2 overflow-y-auto min-h-0 custom-scrollbar">
           {ROWS.map(([key, action]) => (
             <div key={key} className="flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
               <kbd className="text-xs font-mono bg-white border border-slate-300 rounded px-2 py-1">{key}</kbd>

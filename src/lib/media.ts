@@ -18,9 +18,9 @@ export function isRelativeAssetPath(value?: string): boolean {
 // but in dev the renderer is an http://localhost origin and Chromium blocks
 // file:// subresources — this one path works in both.
 function toAppMediaUrl(absPath: string): string {
-  const normalized = String(absPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
-  const encoded = normalized.split('/').map((segment) => encodeURIComponent(segment)).join('/');
-  return `app-media://local/${encoded}`;
+  // Carry the exact absolute path in a query parameter. Encoding path segments
+  // after stripping leading slashes loses UNC (//server/share) and POSIX roots.
+  return `app-media://local/file?path=${encodeURIComponent(String(absPath || ''))}`;
 }
 
 export function resolveAssetSrc(project: Project | null, value?: string): string {
@@ -34,7 +34,12 @@ export function resolveAssetSrc(project: Project | null, value?: string): string
   if (!project?.path) return normalized;
   if (!isRelativeAssetPath(normalized)) return normalized;
 
-  const rel = normalized.replace(/^\/+/, '').replace(/\\/g, '/');
+  const relParts = normalized.replace(/^\/+/, '').replace(/\\/g, '/').split('/');
+  // Project assets are allowed to resolve only inside the project folder.
+  // Reject traversal instead of handing an arbitrary local file to app-media.
+  if (relParts.some((segment) => segment === '..')) return '';
+  const rel = relParts.filter((segment) => segment && segment !== '.').join('/');
+  if (!rel) return '';
   const base = project.path.replace(/[\\/]+$/, '').replace(/\\/g, '/');
   return toAppMediaUrl(`${base}/${rel}`);
 }

@@ -6,6 +6,8 @@ import { Project } from '../../types';
 import { resolveAssetSrc } from '../../lib/media';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
 
+const PLACEMENT_PANORAMA_TIMEOUT_MS = 20_000;
+
 type Props = {
   open: boolean;
   project: Project;
@@ -80,6 +82,8 @@ const ReturnHotspotPlacementModal: React.FC<Props> = ({
   const viewerRef = React.useRef<Viewer | null>(null);
   const [placement, setPlacement] = React.useState<{ yaw: number; pitch: number } | null>(null);
   const placementRef = React.useRef<{ yaw: number; pitch: number } | null>(null);
+  const [viewerLoadState, setViewerLoadState] = React.useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [viewerRetryKey, setViewerRetryKey] = React.useState(0);
   useEscapeClose(open, onCancel);
 
   const sourceScene = React.useMemo(() => project.scenes.find((s) => s.id === sourceSceneId) || null, [project.scenes, sourceSceneId]);
@@ -91,6 +95,7 @@ const ReturnHotspotPlacementModal: React.FC<Props> = ({
   React.useEffect(() => {
     if (!open) {
       setPlacement(null);
+      setViewerLoadState('idle');
     }
   }, [open]);
   React.useEffect(() => {
@@ -98,15 +103,18 @@ const ReturnHotspotPlacementModal: React.FC<Props> = ({
   }, [placement]);
   const resolveConfirmPlacement = React.useCallback((): { yaw: number; pitch: number } | null => {
     if (placementMode === 'entry-view') {
+      if (viewerLoadState !== 'ready') return null;
       const live = normalizeViewerPosition((viewerRef.current as any)?.getPosition?.());
       if (live) return live;
     }
     return placementRef.current;
-  }, [placementMode]);
+  }, [placementMode, viewerLoadState]);
   React.useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Enter') return;
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('button, a[href], [role="button"]')) return;
       const next = resolveConfirmPlacement();
       if (!next) return;
       e.preventDefault();
@@ -119,40 +127,76 @@ const ReturnHotspotPlacementModal: React.FC<Props> = ({
   React.useEffect(() => {
     if (placementMode !== 'entry-view') return;
     if (!open || !containerRef.current || !targetScene) return;
-    const viewer = new Viewer({
-      container: containerRef.current,
-      panorama: panoramaSrc,
-      defaultYaw: targetScene.initialYaw || 0,
-      defaultPitch: targetScene.initialPitch || 0,
-      defaultZoomLvl: targetScene.initialZoom ?? 20,
-      mousewheel: true,
-      loadingTxt: '',
-      navbar: false,
-      plugins: [[MarkersPlugin, { markers: [] }]],
-    });
+    setPlacement(null);
+    setViewerLoadState('loading');
+    let viewer: Viewer;
+    try {
+      viewer = new Viewer({
+        container: containerRef.current,
+        panorama: panoramaSrc,
+        defaultYaw: targetScene.initialYaw || 0,
+        defaultPitch: targetScene.initialPitch || 0,
+        defaultZoomLvl: targetScene.initialZoom ?? 20,
+        mousewheel: true,
+        loadingTxt: '',
+        navbar: false,
+        plugins: [[MarkersPlugin, { markers: [] }]],
+      });
+    } catch {
+      setViewerLoadState('error');
+      return;
+    }
     viewerRef.current = viewer;
     const markersPlugin = viewer.getPlugin(MarkersPlugin) as any;
     markersPlugin.setMarkers([]);
 
+    let alive = true;
+    let ready = false;
     const updatePlacementFromViewer = () => {
+      if (!alive || !ready) return;
       const pos = normalizeViewerPosition((viewer as any)?.getPosition?.());
       if (!pos) return;
       setPlacement(pos);
     };
     const onViewerRender = () => updatePlacementFromViewer();
+    const onPanoramaLoaded = () => {
+      if (!alive) return;
+      ready = true;
+      window.clearTimeout(loadTimeout);
+      setViewerLoadState('ready');
+      updatePlacementFromViewer();
+    };
+    const onPanoramaError = () => {
+      if (!alive || ready) return;
+      window.clearTimeout(loadTimeout);
+      setPlacement(null);
+      setViewerLoadState('error');
+      try { (viewer as any)?.loader?.hide?.(); } catch {}
+      try { (viewer as any)?.hideError?.(); } catch {}
+    };
 
-    updatePlacementFromViewer();
+    const loadTimeout = window.setTimeout(() => {
+      if (!alive || ready) return;
+      try { (viewer as any)?.textureLoader?.abortLoading?.(); } catch {}
+      onPanoramaError();
+    }, PLACEMENT_PANORAMA_TIMEOUT_MS);
+    viewer.addEventListener('panorama-loaded', onPanoramaLoaded as any);
+    viewer.addEventListener('panorama-error', onPanoramaError as any);
     viewer.addEventListener('position-updated', onViewerRender as any);
     viewer.addEventListener('zoom-updated', onViewerRender as any);
     viewer.addEventListener('size-updated', onViewerRender as any);
     return () => {
+      alive = false;
+      window.clearTimeout(loadTimeout);
+      viewer.removeEventListener('panorama-loaded', onPanoramaLoaded as any);
+      viewer.removeEventListener('panorama-error', onPanoramaError as any);
       viewer.removeEventListener('position-updated', onViewerRender as any);
       viewer.removeEventListener('zoom-updated', onViewerRender as any);
       viewer.removeEventListener('size-updated', onViewerRender as any);
       viewer.destroy();
       viewerRef.current = null;
     };
-  }, [open, placementMode, panoramaSrc, targetScene?.id, targetScene?.image, targetScene?.initialPitch, targetScene?.initialYaw, targetScene?.initialZoom]);
+  }, [open, placementMode, panoramaSrc, targetScene?.id, targetScene?.image, targetScene?.initialPitch, targetScene?.initialYaw, targetScene?.initialZoom, viewerRetryKey]);
 
   const handleFlatImageClick = React.useCallback((event: React.MouseEvent<HTMLImageElement>) => {
     const img = imageRef.current;
@@ -201,6 +245,24 @@ const ReturnHotspotPlacementModal: React.FC<Props> = ({
                   <div className="pd-return-crosshair pd-return-crosshair-v" style={{ left: `${(crosshair.xPct * 100).toFixed(3)}%` }} />
                 </>
               )}
+              {viewerLoadState !== 'ready' && (
+                <div className="absolute inset-0 z-[8] flex items-center justify-center bg-black/55">
+                  {viewerLoadState === 'error' ? (
+                    <div className="rounded-xl border border-red-400/30 bg-slate-900/90 px-5 py-4 text-center text-slate-100">
+                      <div className="text-sm font-semibold">Target panorama could not be loaded</div>
+                      <button
+                        type="button"
+                        onClick={() => setViewerRetryKey((value) => value + 1)}
+                        className="mt-3 rounded-lg bg-[#0b86d9] px-3 py-1.5 text-xs font-semibold text-white"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="rounded-full border border-white/20 bg-slate-900/80 px-3 py-1.5 text-xs text-white">Loading target panorama…</div>
+                  )}
+                </div>
+              )}
             </>
           )}
           {placementMode === 'hotspot-position' && (
@@ -242,7 +304,7 @@ const ReturnHotspotPlacementModal: React.FC<Props> = ({
           <div className="flex items-center gap-2">
             <button onClick={onCancel} className="px-4 py-2 rounded-md border border-slate-500 text-slate-100 hover:bg-slate-700">Skip</button>
             <button
-              disabled={!placement}
+              disabled={!placement || (placementMode === 'entry-view' && viewerLoadState !== 'ready')}
               onClick={() => {
                 const next = resolveConfirmPlacement();
                 if (!next) return;
