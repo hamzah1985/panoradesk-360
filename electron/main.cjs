@@ -3161,6 +3161,56 @@ app.whenReady().then(async () => {
     });
   });
 
+  // Picks one image and imports it as a replacement for an existing scene's
+  // panorama. The renderer swaps the paths on the scene, so hotspots, markers,
+  // and orientation are untouched. Old files are left in place so undo stays valid.
+  ipcMain.handle('media:replace-scene-image', async (_evt, project) => {
+    const result = await dialog.showOpenDialog({
+      title: 'Choose the replacement panorama',
+      properties: ['openFile'],
+      filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp'] }],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+
+    const requestedProjectDir = getProjectDir(project);
+    if (deletingProjectIds.has(project?.id)) return null;
+    if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+      throw new Error('This project copy received a new identity. Reopen it before replacing an image.');
+    }
+    return enqueueProjectSave(requestedProjectDir, project?.id, async () => {
+      if (deletingProjectIds.has(project?.id)) return null;
+      if (await isRetiredProjectIdentity(requestedProjectDir, project?.id)) {
+        throw new Error('This project copy received a new identity. Reopen it before replacing an image.');
+      }
+      const projectDir = await ensureProjectScaffold(project);
+      const sourcePath = result.filePaths[0];
+      const createdFiles = [];
+      try {
+        const image = await importSceneImageToProject(projectDir, sourcePath, 'panoramas', {
+          maxEdge: SCENE_IMPORT_MAX_EDGE,
+          quality: SCENE_IMPORT_JPEG_QUALITY,
+        });
+        createdFiles.push(projectAbsolute(projectDir, image));
+        const thumbnail = await importSceneImageToProject(projectDir, sourcePath, 'thumbnails', {
+          maxEdge: SCENE_THUMBNAIL_MAX_EDGE,
+          quality: SCENE_THUMBNAIL_JPEG_QUALITY,
+        });
+        createdFiles.push(projectAbsolute(projectDir, thumbnail));
+        return { projectPath: projectDir, image, thumbnail };
+      } catch (error) {
+        for (const createdFile of createdFiles.reverse()) {
+          if (!createdFile) continue;
+          try {
+            await fs.rm(createdFile, { force: true });
+          } catch (rollbackError) {
+            await logLine(`Unable to roll back replacement image ${createdFile}: ${String(rollbackError?.message || rollbackError)}`);
+          }
+        }
+        throw error;
+      }
+    });
+  });
+
   ipcMain.handle('media:upload-logo', async (_evt, project) => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile'],

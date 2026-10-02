@@ -11,6 +11,10 @@ export type ViewerMotionOptions = {
 export type ViewerInertiaTuning = {
   alphaDragging: number;
   alphaIdle: number;
+  /** Release "fling": time constant (ms) over which the release velocity decays. 0 disables it. */
+  flingTauMs: number;
+  /** Release "fling": speed cap in radians per second. */
+  flingMaxSpeed: number;
 };
 
 // Single source of truth for orbit/motion behavior across editor + preview.
@@ -30,6 +34,11 @@ export const SHARED_VIEWER_MOTION: ViewerMotionOptions = {
 export const SHARED_VIEWER_INERTIA: ViewerInertiaTuning = {
   alphaDragging: 0.14,
   alphaIdle: 0.08,
+  // After letting go the view keeps coasting in the drag direction with the
+  // release velocity, decaying exponentially (like Street View / Matterport).
+  // Total coast distance is about releaseSpeed * flingTauMs.
+  flingTauMs: 150,
+  flingMaxSpeed: 6,
 };
 
 export type ViewerTransitionOptions = {

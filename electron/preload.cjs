@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getPathForFile: (file) => webUtils.getPathForFile(file),
   pickProjectDirectory: () => ipcRenderer.invoke('projects:pick-directory'),
   importSceneImages: (project) => ipcRenderer.invoke('media:import-scenes', project),
+  replaceSceneImage: (project) => ipcRenderer.invoke('media:replace-scene-image', project),
   uploadLogo: (project) => ipcRenderer.invoke('media:upload-logo', project),
   uploadFloorPlan: (project) => ipcRenderer.invoke('media:upload-floorplan', project),
   checkProjectHealth: (project, options) => ipcRenderer.invoke('projects:health-check', project, options),

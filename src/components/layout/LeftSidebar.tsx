@@ -131,6 +131,8 @@ const LeftSidebar = () => {
   const [isDragOverFiles, setIsDragOverFiles] = React.useState(false);
   const [importProgress, setImportProgress] = React.useState<SceneImportProgress | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const replaceInputRef = React.useRef<HTMLInputElement>(null);
+  const replaceTargetRef = React.useRef<string | null>(null);
   const sceneCardRefs = React.useRef<Record<string, HTMLDivElement | null>>({});
   const sceneListScrollRef = React.useRef<HTMLDivElement>(null);
   const lastClickedRef = React.useRef<string | null>(null);
@@ -684,6 +686,71 @@ const LeftSidebar = () => {
       },
     });
   };
+
+  // Swaps a scene's panorama while keeping its hotspots, markers, name, and
+  // starting view. The old files stay on disk so undo keeps working.
+  const applyReplacementImage = (
+    ownerProjectId: string,
+    sceneId: string,
+    update: { image: string; thumbnail: string },
+    projectPath?: string,
+  ) => {
+    const state = useProjectStore.getState();
+    if (state.project?.id !== ownerProjectId || !state.project.scenes.some((s) => s.id === sceneId)) return;
+    if (projectPath && projectPath !== state.project.path) state.updateProject({ path: projectPath });
+    useProjectStore.getState().updateScene(sceneId, update);
+    pushToast('success', 'Scene image replaced');
+  };
+
+  const replaceSceneImage = async (sceneId: string) => {
+    if (!project) return;
+    const ownerProject = project;
+    const desktop = getDesktopApi();
+    if (!desktop) {
+      replaceTargetRef.current = sceneId;
+      replaceInputRef.current?.click();
+      return;
+    }
+    await runProjectOperation(ownerProject.id, async () => {
+      try {
+        const replaced = await desktop.replaceSceneImage(ownerProject);
+        if (!replaced || !mountedRef.current) return;
+        applyReplacementImage(ownerProject.id, sceneId, { image: replaced.image, thumbnail: replaced.thumbnail }, replaced.projectPath);
+      } catch {
+        pushToast('error', 'Failed to replace the scene image');
+      }
+    });
+  };
+
+  const handleReplaceFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = (e.target.files?.[0] ?? null) as File | null;
+    e.target.value = '';
+    const sceneId = replaceTargetRef.current;
+    replaceTargetRef.current = null;
+    const ownerProjectId = useProjectStore.getState().project?.id;
+    if (!file || !sceneId || !ownerProjectId) return;
+    if (!isSupportedImageFile(file)) {
+      pushToast('error', `"${file.name}" is not a supported image`);
+      return;
+    }
+    await runProjectOperation(ownerProjectId, async () => {
+      try {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(file);
+        });
+        const image = await resizeSceneImage(dataUrl);
+        const thumbnail = await generateThumbnail(image, 320);
+        if (!mountedRef.current) return;
+        applyReplacementImage(ownerProjectId, sceneId, { image, thumbnail });
+      } catch {
+        pushToast('error', `Failed to read "${file.name}"`);
+      }
+    });
+  };
+
   const openContextMenuForScene = (sceneId: string, x: number, y: number) => {
     setContextMenu({ x, y, sceneId });
     setSelectedSceneIds([sceneId]);
@@ -702,6 +769,7 @@ const LeftSidebar = () => {
       <div className="p-4 border-b border-border-dark">
         <div className="flex items-center gap-2"><Layers className="w-5 h-5 text-primary" /><h2 className="font-bold text-sm uppercase tracking-widest text-slate-400">Scenes</h2></div>
         <input ref={fileInputRef} type="file" className="hidden" accept="image/*" multiple onChange={handleImport} />
+        <input ref={replaceInputRef} type="file" className="hidden" accept="image/*" onChange={handleReplaceFile} />
       </div>
       <div className="px-4 pt-3 pb-2 border-b border-border-dark">
         <button
@@ -930,6 +998,7 @@ const LeftSidebar = () => {
           >
             Rename
           </button>
+          <button onClick={() => { void replaceSceneImage(contextMenu.sceneId); setContextMenu(null); }} className="w-full text-left px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800 rounded">Replace image…</button>
           <button onClick={() => { duplicateScene(contextMenu.sceneId); setContextMenu(null); }} className="w-full text-left px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800 rounded">Duplicate</button>
           <button
             onClick={() => {

@@ -62,6 +62,7 @@ export interface DesktopApi {
   pickProjectDirectory: () => Promise<string | null>;
   importSceneImages: (project: Project) => Promise<SceneImportResult>;
   onSceneImportProgress: (callback: (progress: SceneImportProgress) => void) => () => void;
+  replaceSceneImage: (project: Project) => Promise<{ projectPath: string; image: string; thumbnail: string } | null>;
   uploadLogo: (project: Project) => Promise<AssetUploadResult | null>;
   uploadFloorPlan: (project: Project) => Promise<AssetUploadResult | null>;
   checkProjectHealth: (project: Project, options?: Partial<ExportOptions>) => Promise<ProjectHealthResult>;
